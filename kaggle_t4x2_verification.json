@@ -1,0 +1,35 @@
+{
+  "status": "VERIFIED_ON_KAGGLE_GPU",
+  "model_variant": "medium",
+  "total_params_M": 51.226,
+  "encoder_params_M": 49.25,
+  "decoder_params_M": 1.977,
+  "hardware": {
+    "gpu_name": "Tesla T4",
+    "gpu_count": 2,
+    "vram_gb_per_gpu": 14.56,
+    "pytorch": "2.11.0+cu130",
+    "cuda": "13.0"
+  },
+  "zero_nan_stability": {
+    "verified": true,
+    "fp16_autocast_exit": true,
+    "logit_clamping": [
+      -30.0,
+      30.0
+    ],
+    "length_sanitization_T_ge_U": true,
+    "nan_count": 0,
+    "inf_count": 0
+  },
+  "training_benchmarks": {
+    "batch_size_per_gpu": 16,
+    "steps_verified": 15,
+    "initial_loss": 698.4883,
+    "final_loss": 649.3177,
+    "step_rate_steps_per_sec": 3.2,
+    "single_gpu_throughput_audio_s_per_sec": 176.0,
+    "dual_gpu_extrapolated_rtf": 351.9,
+    "peak_vram_mb": 3348.9
+  }
+}

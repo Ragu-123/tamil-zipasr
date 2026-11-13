@@ -13,6 +13,10 @@ Key Performance Features:
 - DataLoader multi-worker prefetch (prefetch_factor=4, pin_memory=True) to prevent GPU starvation.
 - Live throughput tracking: steps/sec, audio hours/hour, training RTF multiplier (>750x real-time).
 - Real-time CTC & Transducer validation previews and atomic checkpointing.
+- Live Experiment Visualization Suite:
+  * TensorBoard: native PyTorch SummaryWriter for loss curves, RTF, and text previews.
+  * MLflow: automated hyperparameter tracking and metric streaming (`--use-mlflow`).
+  * Weights & Biases: real-time cloud dashboard tracking (`--use-wandb`).
 """
 
 from __future__ import annotations
@@ -48,6 +52,111 @@ logging.basicConfig(
 logger = logging.getLogger("train_t4x2")
 
 
+# ==============================================================================
+# Unified Experiment Tracking Suite (TensorBoard, MLflow, WandB)
+# ==============================================================================
+
+class ExperimentTracker:
+    """Unified Experiment Tracking & Live Visualization for TensorBoard, MLflow, and WandB."""
+
+    def __init__(self, args: argparse.Namespace, is_main: bool = True):
+        self.is_main = is_main
+        self.tb_writer = None
+        self.use_mlflow = False
+        self.use_wandb = False
+
+        if not self.is_main:
+            return
+
+        # 1. TensorBoard Setup
+        if getattr(args, "use_tensorboard", True):
+            try:
+                from torch.utils.tensorboard import SummaryWriter
+                tb_log_dir = os.path.join(args.tensorboard_dir, f"zip_transducer_{args.variant}_{int(time.time())}")
+                os.makedirs(tb_log_dir, exist_ok=True)
+                self.tb_writer = SummaryWriter(log_dir=tb_log_dir)
+                logger.info(f"TensorBoard logging active at: {tb_log_dir}")
+            except Exception as e:
+                logger.warning(f"Could not initialize TensorBoard ({e})")
+
+        # 2. MLflow Setup
+        if getattr(args, "use_mlflow", False):
+            try:
+                import mlflow
+                if args.mlflow_tracking_uri:
+                    mlflow.set_tracking_uri(args.mlflow_tracking_uri)
+                mlflow.set_experiment(args.mlflow_experiment)
+                run_name = f"zip_{args.variant}_bs{args.batch_size}_accum{args.grad_accum}"
+                mlflow.start_run(run_name=run_name)
+                # Log non-callable arguments
+                params = {k: v for k, v in vars(args).items() if isinstance(v, (int, float, str, bool))}
+                mlflow.log_params(params)
+                self.use_mlflow = True
+                logger.info(f"MLflow active: experiment={args.mlflow_experiment}, run={run_name}")
+            except Exception as e:
+                logger.warning(f"Could not initialize MLflow ({e})")
+
+        # 3. WandB Setup
+        if getattr(args, "use_wandb", False):
+            try:
+                import wandb
+                run_name = args.wandb_run_name or f"zip_{args.variant}_{int(time.time())}"
+                wandb.init(project=args.wandb_project, name=run_name, config=vars(args))
+                self.use_wandb = True
+                logger.info(f"WandB active: project={args.wandb_project}, run={run_name}")
+            except Exception as e:
+                logger.warning(f"Could not initialize WandB ({e})")
+
+    def log_metrics(self, metrics: Dict[str, float], step: int):
+        if not self.is_main:
+            return
+        if self.tb_writer is not None:
+            for k, v in metrics.items():
+                self.tb_writer.add_scalar(k, v, step)
+        if self.use_mlflow:
+            try:
+                import mlflow
+                mlflow.log_metrics(metrics, step=step)
+            except Exception:
+                pass
+        if self.use_wandb:
+            try:
+                import wandb
+                wandb.log(metrics, step=step)
+            except Exception:
+                pass
+
+    def log_text(self, tag: str, text: str, step: int):
+        if not self.is_main:
+            return
+        if self.tb_writer is not None:
+            self.tb_writer.add_text(tag, text, step)
+        if self.use_wandb:
+            try:
+                import wandb
+                wandb.log({tag: wandb.Html(f"<pre>{text}</pre>")}, step=step)
+            except Exception:
+                pass
+
+    def close(self):
+        if not self.is_main:
+            return
+        if self.tb_writer is not None:
+            self.tb_writer.close()
+        if self.use_mlflow:
+            try:
+                import mlflow
+                mlflow.end_run()
+            except Exception:
+                pass
+        if self.use_wandb:
+            try:
+                import wandb
+                wandb.finish()
+            except Exception:
+                pass
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Train ZipTransducer-Tamil on Dual Tesla T4 GPUs")
     parser.add_argument("--variant", type=str, default="medium", choices=["small", "medium", "large"],
@@ -72,6 +181,17 @@ def parse_args():
     parser.add_argument("--log-every", type=int, default=25, help="Logging frequency (steps)")
     parser.add_argument("--eval-every", type=int, default=500, help="Validation preview frequency (steps)")
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume")
+    
+    # Visualization & Tracking Flags
+    parser.add_argument("--use-tensorboard", action="store_true", default=True, help="Log metrics to TensorBoard")
+    parser.add_argument("--tensorboard-dir", type=str, default="./runs", help="TensorBoard run logs directory")
+    parser.add_argument("--use-mlflow", action="store_true", default=False, help="Log metrics & artifacts to MLflow")
+    parser.add_argument("--mlflow-tracking-uri", type=str, default=None, help="MLflow tracking server URI")
+    parser.add_argument("--mlflow-experiment", type=str, default="zip_transducer_tamil", help="MLflow experiment name")
+    parser.add_argument("--use-wandb", action="store_true", default=False, help="Log metrics to Weights & Biases")
+    parser.add_argument("--wandb-project", type=str, default="tamil-zipasr", help="WandB project name")
+    parser.add_argument("--wandb-run-name", type=str, default=None, help="WandB run name")
+    
     return parser.parse_args()
 
 
@@ -113,6 +233,9 @@ def train_worker(rank: int, world_size: int, args: argparse.Namespace):
         logger.info(f"=== Starting Training on {world_size} GPU(s) [{args.variant.upper()} Model] ===")
         logger.info(f"Per-GPU Batch: {args.batch_size} | Grad Accum: {args.grad_accum} | Effective Batch: {effective_batch} utterances/step")
         logger.info(f"Warmup Steps: {args.warmup_steps} | Max Steps: {args.max_steps} | Peak LR: {args.lr}")
+
+    # Initialize Experiment Tracker (TensorBoard, MLflow, WandB on Rank 0)
+    tracker = ExperimentTracker(args, is_main=is_main)
 
     # 1. Tokenizer & Model
     tokenizer = TamilAksharaTokenizer()
@@ -262,6 +385,19 @@ def train_worker(rank: int, world_size: int, args: argparse.Namespace):
                 f"LR: {cur_lr:.2e} | Speed: {steps_per_sec:.2f} step/s | "
                 f"Throughput: {total_audio_throughput:.1f} audio-s/s ({rtf_speedup:.0f}x Real-Time) | VRAM: {vram_mb:.0f}MB"
             )
+
+            # Stream metrics to TensorBoard, MLflow, and WandB
+            tracker.log_metrics({
+                "Loss/total": avg_loss,
+                "Loss/rnnt": avg_rnnt,
+                "Loss/ctc": avg_ctc,
+                "Train/learning_rate": cur_lr,
+                "Train/steps_per_sec": steps_per_sec,
+                "Train/audio_sec_per_sec": total_audio_throughput,
+                "Train/rtf_speedup": rtf_speedup,
+                "System/vram_mb": float(vram_mb),
+            }, step=step)
+
             running_loss = 0.0
             running_rnnt = 0.0
             running_ctc = 0.0
@@ -274,11 +410,14 @@ def train_worker(rank: int, world_size: int, args: argparse.Namespace):
             with torch.no_grad():
                 preds_ctc = raw_model.transcribe(inputs[:2], input_lengths[:2], method="ctc")
                 logger.info(f"--- Step {step} Live Preview ---")
+                preview_text = ""
                 for i in range(min(2, len(preds_ctc))):
                     gold = batch.get("texts", [""])[i] if "texts" in batch and i < len(batch["texts"]) else ""
                     logger.info(f"  Target:     '{gold[:70]}'")
                     logger.info(f"  Prediction: '{preds_ctc[i][:70]}'")
+                    preview_text += f"Target: {gold}\nPred:   {preds_ctc[i]}\n\n"
                 logger.info("--------------------------------")
+                tracker.log_text("Preview/transcriptions", preview_text, step=step)
             model.train()
 
         # Save Checkpoint
@@ -295,6 +434,7 @@ def train_worker(rank: int, world_size: int, args: argparse.Namespace):
 
     if is_main:
         logger.info("Training loop completed successfully!")
+        tracker.close()
 
     if is_distributed:
         cleanup_ddp()
