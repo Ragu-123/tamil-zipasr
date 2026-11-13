@@ -544,7 +544,7 @@ class SubsamplingStem1D(nn.Module):
         x = self.stage2_act(self.stage2_norm(x.transpose(1, 2).contiguous()).transpose(1, 2))
         
         # Output: (B, T0, D)
-        out = x.transpose(1, 2)
+        out = x.transpose(1, 2).contiguous()
         
         out_lens = None
         if lengths is not None:
@@ -589,7 +589,7 @@ class TemporalUpsampler1D(nn.Module):
         # x: (B, T1, D) -> (B, D, T1)
         x_t = x.transpose(1, 2)
         x_up = F.interpolate(x_t, size=target_len, mode="nearest")
-        x_smooth = self.pw(self.dw(x_up)).transpose(1, 2)
+        x_smooth = self.pw(self.dw(x_up)).transpose(1, 2).contiguous()
         return self.act(self.norm(x_smooth))
 
 

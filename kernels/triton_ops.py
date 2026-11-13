@@ -140,12 +140,13 @@ if HAS_TRITON:
             x, weight = ctx.saved_tensors
             B, T, D = x.shape
             dx = torch.empty_like(x)
+            dy_c = dy.contiguous()
             BLOCK_SIZE = triton.next_power_of_2(D)
             grid = (B * T,)
 
             _rmsnorm_bwd_kernel[grid](
-                dy, x, weight, dx,
-                x.stride(0), x.stride(1), x.stride(2),
+                dy_c, x, weight, dx,
+                dy_c.stride(0), dy_c.stride(1), dy_c.stride(2),
                 N_DIMS=D,
                 BLOCK_SIZE=BLOCK_SIZE,
                 EPS=ctx.eps,
@@ -153,7 +154,7 @@ if HAS_TRITON:
             var = x.pow(2).mean(dim=-1, keepdim=True)
             rsqrt = torch.rsqrt(var + ctx.eps)
             norm_x = x * rsqrt
-            dw = (dy * norm_x).sum(dim=(0, 1))
+            dw = (dy_c * norm_x).sum(dim=(0, 1))
             return dx, dw, None
 
 
@@ -164,15 +165,16 @@ def fused_rmsnorm(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> t
     weight: [D]
     Returns: [B, T, D]
     """
-    if HAS_TRITON and x.is_cuda and weight.is_cuda and x.ndim == 3 and x.shape[-1] <= 1024 and x.is_contiguous():
-        if x.requires_grad or weight.requires_grad:
-            return _FusedRMSNormFunction.apply(x, weight, eps)
-        B, T, D = x.shape
-        y = torch.empty_like(x)
+    if HAS_TRITON and x.is_cuda and weight.is_cuda and x.ndim == 3 and x.shape[-1] <= 1024:
+        x_c = x.contiguous()
+        if x_c.requires_grad or weight.requires_grad:
+            return _FusedRMSNormFunction.apply(x_c, weight, eps)
+        B, T, D = x_c.shape
+        y = torch.empty_like(x_c)
         BLOCK_SIZE = triton.next_power_of_2(D)
         _rmsnorm_fwd_kernel[(B * T,)](
-            x, y, weight,
-            x.stride(0), x.stride(1), x.stride(2),
+            x_c, y, weight,
+            x_c.stride(0), x_c.stride(1), x_c.stride(2),
             y.stride(0), y.stride(1), y.stride(2),
             N_DIMS=D,
             BLOCK_SIZE=BLOCK_SIZE,
