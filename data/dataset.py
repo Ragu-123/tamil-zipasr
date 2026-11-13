@@ -167,7 +167,7 @@ class IndicVoicesStreamingDataset(IterableDataset):
         """Decodes, filters, normalizes, and extracts features for a single sample."""
         try:
             # 1. Extract audio data
-            audio_field = raw_sample.get("audio")
+            audio_field = raw_sample.get("audio") or raw_sample.get("audio_filepath")
             if audio_field is None:
                 return None
 
@@ -181,8 +181,10 @@ class IndicVoicesStreamingDataset(IterableDataset):
 
             # 2. Extract and normalize transcript text
             text = (
-                raw_sample.get("text")
+                raw_sample.get("normalized")
+                or raw_sample.get("text")
                 or raw_sample.get("normalized_text")
+                or raw_sample.get("verbatim")
                 or raw_sample.get("verbatim_text")
                 or ""
             )
