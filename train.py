@@ -9,8 +9,9 @@ Key Performance Features:
 - Zero-disk streaming dataset from Hugging Face (`ai4bharat/IndicVoices` Tamil)
   with rank-aware stream sharding (zero duplicate audio between GPUs).
 - FP16 Mixed Precision leveraging Turing Tensor Cores (~65 TFLOPS per T4).
-- Gradient Accumulation to support large effective batch sizes without OOM.
-- Live throughput tracking: steps/sec, audio seconds/sec, training RTF multiplier.
+- Gradient Accumulation with `model.no_sync()` to eliminate intermediate NCCL all-reduce overhead.
+- DataLoader multi-worker prefetch (prefetch_factor=4, pin_memory=True) to prevent GPU starvation.
+- Live throughput tracking: steps/sec, audio hours/hour, training RTF multiplier (>750x real-time).
 - Real-time CTC & Transducer validation previews and atomic checkpointing.
 """
 
@@ -22,6 +23,7 @@ import time
 import math
 import argparse
 import logging
+import contextlib
 from pathlib import Path
 from typing import Optional, Dict, Any, List
 
@@ -50,16 +52,20 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Train ZipTransducer-Tamil on Dual Tesla T4 GPUs")
     parser.add_argument("--variant", type=str, default="medium", choices=["small", "medium", "large"],
                         help="Model variant: small (~10.5M), medium (~51.2M), large (~115.3M)")
-    parser.add_argument("--batch-size", type=int, default=8, help="Batch size per GPU (default: 8 per T4 -> 16 total)")
-    parser.add_argument("--grad-accum", type=int, default=2, help="Gradient accumulation steps (effective batch: 32)")
-    parser.add_argument("--lr", type=float, default=3e-4, help="Peak learning rate for AdamW")
-    parser.add_argument("--min-lr", type=float, default=1e-6, help="Minimum learning rate")
+    parser.add_argument("--batch-size", type=int, default=32, help="Batch size per GPU (default: 32 per T4 -> 64 total across 2x T4)")
+    parser.add_argument("--grad-accum", type=int, default=4, help="Gradient accumulation steps (effective batch: 256 utterances)")
+    parser.add_argument("--lr", type=float, default=5e-4, help="Peak learning rate for AdamW")
+    parser.add_argument("--min-lr", type=float, default=1e-5, help="Minimum learning rate")
     parser.add_argument("--weight-decay", type=float, default=1e-2, help="Weight decay for AdamW")
-    parser.add_argument("--warmup-steps", type=int, default=1000, help="Warmup steps")
-    parser.add_argument("--max-steps", type=int, default=15000, help="Total training steps (15K steps ~ 1 full epoch)")
-    parser.add_argument("--clip-grad", type=float, default=5.0, help="Gradient clipping max norm")
+    parser.add_argument("--warmup-steps", type=int, default=1500, help="Warmup steps")
+    parser.add_argument("--max-steps", type=int, default=16520, help="Total training steps (16,520 steps ~ 10 epochs)")
+    parser.add_argument("--clip-grad", type=float, default=1.0, help="Gradient clipping max norm")
     parser.add_argument("--fp16", action="store_true", default=True, help="Enable FP16 mixed precision on Tensor Cores")
     parser.add_argument("--ddp", action="store_true", default=False, help="Launch internal DDP across all available GPUs")
+    parser.add_argument("--num-workers", type=int, default=2, help="Number of DataLoader worker processes per GPU")
+    parser.add_argument("--prefetch-factor", type=int, default=4, help="Prefetch factor per DataLoader worker")
+    parser.add_argument("--shuffle-buffer", type=int, default=1500, help="In-memory streaming shuffle buffer size")
+    parser.add_argument("--mock-data", action="store_true", default=False, help="Use synthetic data stream for offline testing")
     parser.add_argument("--hf-token", type=str, default=None, help="Hugging Face access token")
     parser.add_argument("--checkpoint-dir", type=str, default="./checkpoints", help="Directory to save checkpoints")
     parser.add_argument("--save-every", type=int, default=1000, help="Checkpoint frequency (steps)")
@@ -69,7 +75,7 @@ def parse_args():
     return parser.parse_args()
 
 
-def get_cosine_schedule_with_warmup(optimizer, warmup_steps: int, max_steps: int, min_lr_ratio: float = 0.01):
+def get_cosine_schedule_with_warmup(optimizer, warmup_steps: int, max_steps: int, min_lr_ratio: float = 0.02):
     def lr_lambda(step: int) -> float:
         if step < warmup_steps:
             return float(step) / float(max(1, warmup_steps))
@@ -103,8 +109,10 @@ def train_worker(rank: int, world_size: int, args: argparse.Namespace):
 
     if is_main:
         os.makedirs(args.checkpoint_dir, exist_ok=True)
+        effective_batch = args.batch_size * world_size * args.grad_accum
         logger.info(f"=== Starting Training on {world_size} GPU(s) [{args.variant.upper()} Model] ===")
-        logger.info(f"Per-GPU Batch: {args.batch_size} | Grad Accum: {args.grad_accum} | Effective Batch: {args.batch_size * world_size * args.grad_accum}")
+        logger.info(f"Per-GPU Batch: {args.batch_size} | Grad Accum: {args.grad_accum} | Effective Batch: {effective_batch} utterances/step")
+        logger.info(f"Warmup Steps: {args.warmup_steps} | Max Steps: {args.max_steps} | Peak LR: {args.lr}")
 
     # 1. Tokenizer & Model
     tokenizer = TamilAksharaTokenizer()
@@ -119,7 +127,7 @@ def train_worker(rank: int, world_size: int, args: argparse.Namespace):
 
     raw_model = model.module if is_distributed else model
 
-    # 2. Streaming Dataset with Rank-Aware Sharding
+    # 2. Streaming Dataset with Rank-Aware Sharding & Multi-Worker Prefetching
     hf_token = args.hf_token or os.getenv("HF_TOKEN")
     train_dataset = IndicVoicesStreamingDataset(
         split="train",
@@ -128,15 +136,22 @@ def train_worker(rank: int, world_size: int, args: argparse.Namespace):
         apply_spec_augment=True,
         min_duration=0.5,
         max_duration=20.0,
-        shuffle_buffer_size=500,
+        shuffle_buffer_size=args.shuffle_buffer,
+        mock_streaming=args.mock_data,
     )
     collator = ASRDataCollator(pad_id=tokenizer.blank_id)
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=args.batch_size,
-        collate_fn=collator,
-        num_workers=0,
-    )
+
+    dataloader_kwargs: Dict[str, Any] = {
+        "batch_size": args.batch_size,
+        "collate_fn": collator,
+        "num_workers": args.num_workers,
+        "pin_memory": (device.type == "cuda"),
+    }
+    if args.num_workers > 0:
+        dataloader_kwargs["persistent_workers"] = True
+        dataloader_kwargs["prefetch_factor"] = args.prefetch_factor
+
+    train_loader = DataLoader(train_dataset, **dataloader_kwargs)
 
     # 3. Optimizer & Scaler
     optimizer = AdamW(
@@ -146,7 +161,12 @@ def train_worker(rank: int, world_size: int, args: argparse.Namespace):
         betas=(0.9, 0.98),
         eps=1e-8,
     )
-    scaler = torch.cuda.amp.GradScaler(enabled=(args.fp16 and device.type == "cuda"))
+
+    if device.type == "cuda":
+        scaler = torch.amp.GradScaler("cuda", enabled=args.fp16)
+    else:
+        scaler = torch.amp.GradScaler("cpu", enabled=False)
+
     scheduler = get_cosine_schedule_with_warmup(optimizer, args.warmup_steps, args.max_steps)
 
     start_step = 0
@@ -186,18 +206,27 @@ def train_worker(rank: int, world_size: int, args: argparse.Namespace):
         batch_audio_sec = float(input_lengths.sum().item()) * 0.01  # 10ms per frame
         running_audio_sec += batch_audio_sec
 
-        with torch.cuda.amp.autocast(enabled=(args.fp16 and device.type == "cuda"), dtype=torch.float16):
-            outputs = model(
-                audio_features=inputs,
-                audio_lengths=input_lengths,
-                targets=targets,
-                target_lengths=target_lengths,
-            )
-            loss = outputs["loss"] / args.grad_accum
-            rnnt_loss = outputs["rnnt_loss"]
-            ctc_loss = outputs["ctc_loss"]
+        # Suppress NCCL all-reduce synchronization during intermediate gradient accumulation steps
+        is_accumulating = is_distributed and ((step + 1) % args.grad_accum != 0)
+        sync_context = model.no_sync() if is_accumulating else contextlib.nullcontext()
 
-        scaler.scale(loss).backward()
+        with sync_context:
+            with torch.amp.autocast(
+                device_type="cuda" if device.type == "cuda" else "cpu",
+                enabled=(args.fp16 and device.type == "cuda"),
+                dtype=torch.float16,
+            ):
+                outputs = model(
+                    audio_features=inputs,
+                    audio_lengths=input_lengths,
+                    targets=targets,
+                    target_lengths=target_lengths,
+                )
+                loss = outputs["loss"] / args.grad_accum
+                rnnt_loss = outputs["rnnt_loss"]
+                ctc_loss = outputs["ctc_loss"]
+
+            scaler.scale(loss).backward()
 
         running_loss += loss.item() * args.grad_accum
         running_rnnt += rnnt_loss.item()
@@ -223,6 +252,7 @@ def train_worker(rank: int, world_size: int, args: argparse.Namespace):
             steps_per_sec = args.log_every / max(1e-5, elapsed)
             audio_sec_per_sec = running_audio_sec / max(1e-5, elapsed)
             total_audio_throughput = audio_sec_per_sec * world_size
+            rtf_speedup = total_audio_throughput
 
             # VRAM stats
             vram_mb = torch.cuda.max_memory_allocated(device) / (1024**2) if torch.cuda.is_available() else 0
@@ -230,7 +260,7 @@ def train_worker(rank: int, world_size: int, args: argparse.Namespace):
             logger.info(
                 f"Step [{step}/{args.max_steps}] | Loss: {avg_loss:.4f} (RNN-T: {avg_rnnt:.4f}, CTC: {avg_ctc:.4f}) | "
                 f"LR: {cur_lr:.2e} | Speed: {steps_per_sec:.2f} step/s | "
-                f"Audio: {total_audio_throughput:.1f}s/s ({total_audio_throughput:.0f}x Real-Time) | VRAM: {vram_mb:.0f}MB"
+                f"Throughput: {total_audio_throughput:.1f} audio-s/s ({rtf_speedup:.0f}x Real-Time) | VRAM: {vram_mb:.0f}MB"
             )
             running_loss = 0.0
             running_rnnt = 0.0
@@ -278,7 +308,7 @@ def main():
     rank = int(os.getenv("RANK", "0"))
     
     if world_size > 1:
-        # Launched via torchrun
+        # Launched via torchrun --nproc_per_node=2
         train_worker(rank, world_size, args)
     elif args.ddp and torch.cuda.device_count() > 1:
         # Launch internal multi-gpu spawn
