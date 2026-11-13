@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tamil-zipasr"
+version = "0.1.0"
+description = "ZipTransducer-Tamil: Ultra-Compact & High-Fidelity Tamil Speech Recognition Model Family (10.5M - 115M)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [
+    { name = "Ragu", email = "ragu@indic-ai.local" }
+]
+keywords = ["asr", "speech-recognition", "tamil", "indic", "zipformer", "transducer", "triton", "deep-learning"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
+dependencies = [
+    "torch>=2.1.0",
+    "torchaudio>=2.1.0",
+    "soundfile>=0.12.0",
+    "datasets>=2.18.0",
+    "huggingface_hub>=0.20.0",
+    "psutil>=5.9.0",
+    "tqdm>=4.66.0",
+    "numpy>=1.24.0",
+]
+
+[project.optional-dependencies]
+cuda = [
+    "triton>=3.0.0",
+]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["models*", "data*", "kernels*"]

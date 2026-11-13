@@ -1,0 +1,35 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# PyTorch checkpoints and models
+*.pt
+*.pth
+*.bin
+*.safetensors
+checkpoints/
+runs/
+wandb/
+
+# Data and artifacts
+data_cache/
+*.parquet
+*.wav
+*.mp3
+*.flac
+*.log
+*.meta.json
+*.done
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# IDE & OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
