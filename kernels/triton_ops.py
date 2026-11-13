@@ -275,6 +275,15 @@ def fused_causal_dwconv1d_swiglu(
     D_out = C // 2
     assert C % 2 == 0, "Channel count must be even for SwiGLU"
 
+    if torch.is_grad_enabled() and (x.requires_grad or weight.requires_grad or (bias is not None and bias.requires_grad)):
+        x_ch = x.transpose(1, 2)
+        x_pad = F.pad(x_ch, (kernel_size - 1, 0))
+        w = weight.unsqueeze(1) if weight.ndim == 2 else weight
+        c_out = F.conv1d(x_pad, w, bias, groups=C).transpose(1, 2)
+        z1 = c_out[:, :, :D_out]
+        z2 = c_out[:, :, D_out:]
+        return z1 * F.silu(z2)
+
     if HAS_TRITON and x.is_cuda and weight.is_cuda:
         w_2d = weight.squeeze(1) if weight.ndim == 3 else weight
         out = torch.empty((B, T, D_out), device=x.device, dtype=x.dtype)
@@ -465,6 +474,35 @@ def fused_chunked_linear_attention(
     Returns: [B, H, T, D]
     """
     B, H, T, D = q.shape
+    if torch.is_grad_enabled() and (q.requires_grad or k.requires_grad or v.requires_grad):
+        scale = 1.0 / math.sqrt(D)
+        q_sc = q * scale
+        num_chunks = (T + chunk_size - 1) // chunk_size
+        s = torch.zeros(B, H, D, D, device=q.device, dtype=q.dtype)
+        outs = []
+        offs_c = torch.arange(chunk_size, device=q.device)
+        causal_mask = offs_c.unsqueeze(1) >= offs_c.unsqueeze(0)
+
+        for m in range(num_chunks):
+            t_s = m * chunk_size
+            t_e = min(t_s + chunk_size, T)
+            act_len = t_e - t_s
+
+            qc = q_sc[:, :, t_s:t_e, :]
+            kc = k[:, :, t_s:t_e, :]
+            vc = v[:, :, t_s:t_e, :]
+
+            o_inter = torch.matmul(qc, s)
+            a_intra = torch.matmul(qc, kc.transpose(-1, -2))
+            c_mask = causal_mask[:act_len, :act_len]
+            a_intra = a_intra.masked_fill(~c_mask, 0.0)
+            o_intra = torch.matmul(a_intra, vc)
+
+            outs.append(o_inter + o_intra)
+            s_up = torch.matmul(kc.transpose(-1, -2), vc)
+            s = s * decay_rate + s_up
+
+        return torch.cat(outs, dim=2)
     if HAS_TRITON and q.is_cuda and D in [16, 32, 64, 128]:
         out = torch.empty_like(q)
         scale = 1.0 / math.sqrt(D)
@@ -708,8 +746,9 @@ if HAS_TRITON:
         e_val = tl.load(enc_ptrs, mask=mask, other=0.0).to(tl.float32)
         p_val = tl.load(pred_ptrs, mask=mask, other=0.0).to(tl.float32)
 
-        sum_val = e_val + p_val
-        out_val = (tl.exp(2.0 * sum_val) - 1.0) / (tl.exp(2.0 * sum_val) + 1.0)
+        sum_val = tl.clamp(e_val + p_val, -15.0, 15.0)
+        exp_2x = tl.exp(2.0 * sum_val)
+        out_val = (exp_2x - 1.0) / (exp_2x + 1.0)
 
         out_ptrs = Out_ptr + b * stride_ob + t * stride_ot + u * stride_ou + offs_d * stride_od
         tl.store(out_ptrs, out_val, mask=mask)
@@ -723,6 +762,9 @@ def fused_joint_tanh(enc_outputs: torch.Tensor, pred_outputs: torch.Tensor) -> t
     pred_outputs: [B, U, D]
     Returns: [B, T, U, D]
     """
+    if torch.is_grad_enabled() and (enc_outputs.requires_grad or pred_outputs.requires_grad):
+        return torch.tanh(enc_outputs.unsqueeze(2) + pred_outputs.unsqueeze(1))
+
     B, T, D = enc_outputs.shape
     _, U, _ = pred_outputs.shape
 
