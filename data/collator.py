@@ -26,14 +26,14 @@ class ASRDataCollator:
 
     def __init__(
         self,
-        pad_id: int = 0,
+        pad_id: int = 1,
         mel_pad_value: float = 0.0,
         device: Optional[torch.device] = None,
     ):
         """Initializes the collator.
 
         Args:
-            pad_id: Token ID used for target sequence padding (default: 0 / <blank>).
+            pad_id: Token ID used for target sequence padding (default: 1 / <pad>).
             mel_pad_value: Floating-point value used for mel-spectrogram padding (default: 0.0).
             device: Optional target torch.device to automatically transfer tensors to.
         """

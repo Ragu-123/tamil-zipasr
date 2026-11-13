@@ -498,10 +498,15 @@ class ZipBlock(nn.Module):
     def forward(self, x: torch.Tensor, key_padding_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         # 1. Attention
         x = x + self.scale_attn * self.attn(self.norm_attn(x), key_padding_mask=key_padding_mask)
-        # 2. Conv
-        x = x + self.scale_conv * self.conv(self.norm_conv(x))
-        # 3. FFN
-        x = x + self.scale_ffn * self.ffn(self.norm_ffn(x))
+        
+        # 2. Conv & 3. FFN with strict padding masking (P1-2)
+        if key_padding_mask is not None:
+            mask_f = key_padding_mask.unsqueeze(-1).to(x.dtype)
+            x = (x + self.scale_conv * self.conv(self.norm_conv(x * mask_f))) * mask_f
+            x = (x + self.scale_ffn * self.ffn(self.norm_ffn(x))) * mask_f
+        else:
+            x = x + self.scale_conv * self.conv(self.norm_conv(x))
+            x = x + self.scale_ffn * self.ffn(self.norm_ffn(x))
         return x
 
 
@@ -713,6 +718,8 @@ class UltraCompactAcousticEncoder(nn.Module):
 
         # 7. Final Normalization
         out = self.final_norm(x)
+        if mask_r1 is not None:
+            out = out * mask_r1.unsqueeze(-1).to(out.dtype)
         return out, out_lens
 
     def count_parameters(self) -> int:

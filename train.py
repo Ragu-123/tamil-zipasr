@@ -165,16 +165,16 @@ class ExperimentTracker:
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train ZipTransducer-Tamil on Dual Tesla T4 GPUs")
-    parser.add_argument("--variant", type=str, default="medium", choices=["small", "medium", "large"],
+    parser.add_argument("--variant", "--model-variant", dest="variant", type=str, default="medium", choices=["small", "medium", "large"],
                         help="Model variant: small (~10.5M), medium (~51.2M), large (~115.3M)")
     parser.add_argument("--batch-size", type=int, default=8, help="Batch size per GPU (default: 8 per T4 -> 16 total across 2x T4, safe against 4D RNN-T VRAM spikes)")
     parser.add_argument("--grad-accum", type=int, default=16, help="Gradient accumulation steps (effective batch: 256 utterances)")
     parser.add_argument("--max-duration", type=float, default=12.0, help="Maximum audio duration in seconds to cap 4D joint tensor memory")
-    parser.add_argument("--lr", type=float, default=5e-4, help="Peak learning rate for AdamW")
+    parser.add_argument("--lr", "--lr-peak", dest="lr", type=float, default=5e-4, help="Peak learning rate for AdamW")
     parser.add_argument("--min-lr", type=float, default=1e-5, help="Minimum learning rate")
     parser.add_argument("--weight-decay", type=float, default=1e-2, help="Weight decay for AdamW")
-    parser.add_argument("--warmup-steps", type=int, default=1500, help="Warmup steps")
-    parser.add_argument("--max-steps", type=int, default=16520, help="Total training steps (16,520 steps ~ 10 epochs)")
+    parser.add_argument("--warmup-steps", "--lr-warmup", dest="warmup_steps", type=int, default=1500, help="Warmup steps")
+    parser.add_argument("--max-steps", "--total-steps", dest="max_steps", type=int, default=16520, help="Total training steps (16,520 steps ~ 10 epochs)")
     parser.add_argument("--clip-grad", type=float, default=1.0, help="Gradient clipping max norm")
     parser.add_argument("--fp16", action="store_true", default=True, help="Enable FP16 mixed precision on Tensor Cores")
     parser.add_argument("--ddp", action="store_true", default=False, help="Launch internal DDP across all available GPUs")
@@ -183,7 +183,7 @@ def parse_args():
     parser.add_argument("--shuffle-buffer", type=int, default=1500, help="In-memory streaming shuffle buffer size")
     parser.add_argument("--mock-data", action="store_true", default=False, help="Use synthetic data stream for offline testing")
     parser.add_argument("--hf-token", type=str, default=None, nargs="?", const="", help="Hugging Face access token")
-    parser.add_argument("--checkpoint-dir", type=str, default="./checkpoints", help="Directory to save checkpoints")
+    parser.add_argument("--checkpoint-dir", "--save-dir", dest="checkpoint_dir", type=str, default="./checkpoints", help="Directory to save checkpoints")
     parser.add_argument("--save-every", type=int, default=500, help="Checkpoint frequency (steps)")
     parser.add_argument("--log-every", type=int, default=25, help="Logging frequency (steps)")
     parser.add_argument("--eval-every", type=int, default=500, help="Validation preview frequency (steps)")
@@ -253,7 +253,7 @@ def train_worker(rank: int, world_size: int, args: argparse.Namespace):
         logger.info(f"Model parameters: {total_p / 1e6:.2f}M | Vocab size: {tokenizer.vocab_size}")
 
     if is_distributed:
-        model = DDP(model, device_ids=[rank] if device.type == "cuda" else None, find_unused_parameters=True)
+        model = DDP(model, device_ids=[rank] if device.type == "cuda" else None, find_unused_parameters=False)
 
     raw_model = model.module if is_distributed else model
 
@@ -289,7 +289,7 @@ def train_worker(rank: int, world_size: int, args: argparse.Namespace):
         shuffle_buffer_size=args.shuffle_buffer,
         mock_streaming=args.mock_data,
     )
-    collator = ASRDataCollator(pad_id=tokenizer.blank_id)
+    collator = ASRDataCollator(pad_id=tokenizer.pad_id)
 
     dataloader_kwargs: Dict[str, Any] = {
         "batch_size": args.batch_size,
@@ -303,11 +303,30 @@ def train_worker(rank: int, world_size: int, args: argparse.Namespace):
 
     train_loader = DataLoader(train_dataset, **dataloader_kwargs)
 
-    # 3. Optimizer & Scaler
+    # 3. Optimizer & Scaler with Weight Decay Separation
+    decay_params = []
+    no_decay_params = []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        # Biases, 1D normalization weights, LayerScale, and token embeddings do not receive weight decay
+        if param.ndim < 2 or "bias" in name or "norm" in name or "scale_" in name or "embedding" in name:
+            no_decay_params.append(param)
+        else:
+            decay_params.append(param)
+
+    if is_main:
+        logger.info(
+            f"AdamW Parameter Separation: {len(decay_params)} decayed tensors (wd={args.weight_decay}), "
+            f"{len(no_decay_params)} non-decayed tensors (wd=0.0)"
+        )
+
     optimizer = AdamW(
-        model.parameters(),
+        [
+            {"params": decay_params, "weight_decay": args.weight_decay},
+            {"params": no_decay_params, "weight_decay": 0.0},
+        ],
         lr=args.lr,
-        weight_decay=args.weight_decay,
         betas=(0.9, 0.98),
         eps=1e-8,
     )
@@ -337,21 +356,38 @@ def train_worker(rank: int, world_size: int, args: argparse.Namespace):
         ckpt = torch.load(resume_path, map_location=device)
         raw_model.load_state_dict(ckpt["model_state_dict"])
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        if "scaler_state_dict" in ckpt and hasattr(scaler, "load_state_dict"):
+            try:
+                scaler.load_state_dict(ckpt["scaler_state_dict"])
+            except Exception as e:
+                if is_main:
+                    logger.warning(f"Could not restore scaler state: {e}")
         start_step = ckpt.get("step", 0)
-        for _ in range(start_step):
-            scheduler.step()
+        if "scheduler_state_dict" in ckpt:
+            try:
+                scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+            except Exception as e:
+                if is_main:
+                    logger.warning(f"Could not restore scheduler state: {e}")
+                for _ in range(start_step):
+                    scheduler.step()
+        else:
+            for _ in range(start_step):
+                scheduler.step()
         if is_main:
-            logger.info(f"Resumed at step {start_step} with LR: {scheduler.get_last_lr()[0]:.2e}")
+            logger.info(f"Resumed at optimizer step {start_step} with LR: {scheduler.get_last_lr()[0]:.2e}")
 
     # 4. Training Loop
     model.train()
     optimizer.zero_grad()
 
     step = start_step
+    micro_step = start_step * args.grad_accum
     running_loss = 0.0
     running_rnnt = 0.0
     running_ctc = 0.0
     running_audio_sec = 0.0
+    accum_batches = 0
     t_start = time.time()
 
     data_iter = iter(train_loader)
@@ -371,8 +407,12 @@ def train_worker(rank: int, world_size: int, args: argparse.Namespace):
         batch_audio_sec = float(input_lengths.sum().item()) * 0.01  # 10ms per frame
         running_audio_sec += batch_audio_sec
 
+        # Advance micro-step and batch counter
+        micro_step += 1
+        accum_batches += 1
+
         # Suppress NCCL all-reduce synchronization during intermediate gradient accumulation steps
-        is_accumulating = is_distributed and ((step + 1) % args.grad_accum != 0)
+        is_accumulating = is_distributed and (micro_step % args.grad_accum != 0)
         sync_context = model.no_sync() if is_accumulating else contextlib.nullcontext()
 
         with sync_context:
@@ -397,7 +437,8 @@ def train_worker(rank: int, world_size: int, args: argparse.Namespace):
         running_rnnt += rnnt_loss.item()
         running_ctc += ctc_loss.item()
 
-        if (step + 1) % args.grad_accum == 0:
+        # Update model parameters strictly when gradient accumulation cycle finishes
+        if micro_step % args.grad_accum == 0:
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad)
             scale_before = scaler.get_scale() if hasattr(scaler, "get_scale") else 1.0
@@ -408,80 +449,85 @@ def train_worker(rank: int, world_size: int, args: argparse.Namespace):
                 scheduler.step()
             optimizer.zero_grad()
 
-        step += 1
+            step += 1
 
-        # Periodic Logging (Rank 0)
-        if is_main and step % args.log_every == 0:
-            elapsed = time.time() - t_start
-            cur_lr = scheduler.get_last_lr()[0]
-            avg_loss = running_loss / args.log_every
-            avg_rnnt = running_rnnt / args.log_every
-            avg_ctc = running_ctc / args.log_every
-            steps_per_sec = args.log_every / max(1e-5, elapsed)
-            audio_sec_per_sec = running_audio_sec / max(1e-5, elapsed)
-            total_audio_throughput = audio_sec_per_sec * world_size
-            rtf_speedup = total_audio_throughput
+            # Periodic Logging (Rank 0) - evaluated strictly on optimizer step
+            if is_main and step % args.log_every == 0:
+                elapsed = time.time() - t_start
+                cur_lr = scheduler.get_last_lr()[0]
+                n_batches = max(1, accum_batches)
+                avg_loss = running_loss / n_batches
+                avg_rnnt = running_rnnt / n_batches
+                avg_ctc = running_ctc / n_batches
+                steps_per_sec = args.log_every / max(1e-5, elapsed)
+                audio_sec_per_sec = running_audio_sec / max(1e-5, elapsed)
+                total_audio_throughput = audio_sec_per_sec * world_size
+                rtf_speedup = total_audio_throughput
 
-            # VRAM stats
-            vram_mb = torch.cuda.max_memory_allocated(device) / (1024**2) if torch.cuda.is_available() else 0
+                # VRAM stats
+                vram_mb = torch.cuda.max_memory_allocated(device) / (1024**2) if torch.cuda.is_available() else 0
 
-            logger.info(
-                f"Step [{step}/{args.max_steps}] | Loss: {avg_loss:.4f} (RNN-T: {avg_rnnt:.4f}, CTC: {avg_ctc:.4f}) | "
-                f"LR: {cur_lr:.2e} | Speed: {steps_per_sec:.2f} step/s | "
-                f"Throughput: {total_audio_throughput:.1f} audio-s/s ({rtf_speedup:.0f}x Real-Time) | VRAM: {vram_mb:.0f}MB"
-            )
+                logger.info(
+                    f"Step [{step}/{args.max_steps}] (Micro: {micro_step}) | Loss: {avg_loss:.4f} (RNN-T: {avg_rnnt:.4f}, CTC: {avg_ctc:.4f}) | "
+                    f"LR: {cur_lr:.2e} | Speed: {steps_per_sec:.2f} step/s | "
+                    f"Throughput: {total_audio_throughput:.1f} audio-s/s ({rtf_speedup:.0f}x Real-Time) | VRAM: {vram_mb:.0f}MB"
+                )
 
-            # Stream metrics to TensorBoard, MLflow, and WandB
-            tracker.log_metrics({
-                "Loss/total": avg_loss,
-                "Loss/rnnt": avg_rnnt,
-                "Loss/ctc": avg_ctc,
-                "Train/learning_rate": cur_lr,
-                "Train/steps_per_sec": steps_per_sec,
-                "Train/audio_sec_per_sec": total_audio_throughput,
-                "Train/rtf_speedup": rtf_speedup,
-                "System/vram_mb": float(vram_mb),
-            }, step=step)
+                # Stream metrics to TensorBoard, MLflow, and WandB
+                tracker.log_metrics({
+                    "Loss/total": avg_loss,
+                    "Loss/rnnt": avg_rnnt,
+                    "Loss/ctc": avg_ctc,
+                    "Train/learning_rate": cur_lr,
+                    "Train/steps_per_sec": steps_per_sec,
+                    "Train/audio_sec_per_sec": total_audio_throughput,
+                    "Train/rtf_speedup": rtf_speedup,
+                    "System/vram_mb": float(vram_mb),
+                }, step=step)
 
-            running_loss = 0.0
-            running_rnnt = 0.0
-            running_ctc = 0.0
-            running_audio_sec = 0.0
-            t_start = time.time()
+                running_loss = 0.0
+                running_rnnt = 0.0
+                running_ctc = 0.0
+                running_audio_sec = 0.0
+                accum_batches = 0
+                t_start = time.time()
 
-        # Periodic VRAM Cache Defragmentation
-        if step % 200 == 0 and torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-        # Validation Preview
-        if is_main and step % args.eval_every == 0:
-            model.eval()
-            with torch.no_grad():
-                preds_ctc = raw_model.transcribe(inputs[:2], input_lengths[:2], method="ctc")
-                logger.info(f"--- Step {step} Live Preview ---")
-                preview_text = ""
-                for i in range(min(2, len(preds_ctc))):
-                    gold = batch.get("texts", [""])[i] if "texts" in batch and i < len(batch["texts"]) else ""
-                    logger.info(f"  Target:     '{gold[:70]}'")
-                    logger.info(f"  Prediction: '{preds_ctc[i][:70]}'")
-                    preview_text += f"Target: {gold}\nPred:   {preds_ctc[i]}\n\n"
-                logger.info("--------------------------------")
-                tracker.log_text("Preview/transcriptions", preview_text, step=step)
-            if torch.cuda.is_available():
+            # Periodic VRAM Cache Defragmentation
+            if step % 200 == 0 and torch.cuda.is_available():
                 torch.cuda.empty_cache()
-            model.train()
 
-        # Save Checkpoint
-        if is_main and (step % args.save_every == 0 or step == args.max_steps):
-            save_path = os.path.join(args.checkpoint_dir, f"zip_transducer_{args.variant}_step_{step}.pt")
-            logger.info(f"Saving checkpoint to {save_path}")
-            torch.save({
-                "step": step,
-                "variant": args.variant,
-                "config": raw_model.config,
-                "model_state_dict": raw_model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-            }, save_path)
+            # Validation Preview
+            if is_main and step % args.eval_every == 0:
+                model.eval()
+                with torch.no_grad():
+                    preds_ctc = raw_model.transcribe(inputs[:2], input_lengths[:2], method="ctc")
+                    logger.info(f"--- Step {step} Live Preview ---")
+                    preview_text = ""
+                    for i in range(min(2, len(preds_ctc))):
+                        gold = batch.get("texts", [""])[i] if "texts" in batch and i < len(batch["texts"]) else ""
+                        logger.info(f"  Target:     '{gold[:70]}'")
+                        logger.info(f"  Prediction: '{preds_ctc[i][:70]}'")
+                        preview_text += f"Target: {gold}\nPred:   {preds_ctc[i]}\n\n"
+                    logger.info("--------------------------------")
+                    tracker.log_text("Preview/transcriptions", preview_text, step=step)
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                model.train()
+
+            # Save Checkpoint
+            if is_main and (step % args.save_every == 0 or step == args.max_steps):
+                save_path = os.path.join(args.checkpoint_dir, f"zip_transducer_{args.variant}_step_{step}.pt")
+                logger.info(f"Saving checkpoint to {save_path}")
+                torch.save({
+                    "step": step,
+                    "micro_step": micro_step,
+                    "variant": args.variant,
+                    "config": raw_model.config,
+                    "model_state_dict": raw_model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "scaler_state_dict": scaler.state_dict(),
+                    "scheduler_state_dict": scheduler.state_dict(),
+                }, save_path)
 
     if is_main:
         logger.info("Training loop completed successfully!")

@@ -614,10 +614,14 @@ if HAS_TRITON:
 def fused_log_softmax(x: torch.Tensor) -> torch.Tensor:
     """
     Numerically stable Log-Softmax kernel.
-    Converts FP16/BF16 logits to FP32 log-probabilities without intermediate memory bloat.
+    Preserves autograd differentiation during training (dispatches to F.log_softmax).
+    Accelerates inference on CUDA via fused Triton forward kernel without intermediate memory.
     x: [B, T, V]
     Returns: [B, T, V] in float32.
     """
+    if torch.is_grad_enabled() and x.requires_grad:
+        return F.log_softmax(x.float(), dim=-1)
+
     B, T, V = x.shape
     if HAS_TRITON and x.is_cuda:
         out = torch.empty((B, T, V), device=x.device, dtype=torch.float32)
@@ -688,11 +692,16 @@ if HAS_TRITON:
         tl.store(out_ptr, best_id)
 
 
-def fast_ctc_greedy_decode(logits: torch.Tensor, blank_id: int = 0) -> List[torch.Tensor]:
+def fast_ctc_greedy_decode(
+    logits: torch.Tensor,
+    blank_id: int = 0,
+    input_lengths: Optional[torch.Tensor] = None,
+) -> List[torch.Tensor]:
     """
     Fast GPU-accelerated CTC Greedy Decoder.
-    Performs argmax, deduplication of repeated tokens, and blank removal directly on GPU.
+    Performs argmax, deduplication of repeated tokens, blank removal, and length masking.
     logits: [B, T, V]
+    input_lengths: Optional [B] valid acoustic frame lengths
     Returns: list of 1D tensors (decoded token sequences) for each item in the batch.
     """
     B, T, V = logits.shape
@@ -714,6 +723,11 @@ def fast_ctc_greedy_decode(logits: torch.Tensor, blank_id: int = 0) -> List[torc
     diff = torch.ones_like(best_ids, dtype=torch.bool)
     diff[:, 1:] = best_ids[:, 1:] != best_ids[:, :-1]
     valid_mask = diff & (best_ids != blank_id)
+
+    # Mask out padded frames beyond valid sequence length
+    if input_lengths is not None:
+        time_indices = torch.arange(T, device=logits.device).unsqueeze(0)
+        valid_mask = valid_mask & (time_indices < input_lengths.unsqueeze(1))
 
     decoded = [best_ids[b][valid_mask[b]] for b in range(B)]
     return decoded

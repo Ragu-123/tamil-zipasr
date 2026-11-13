@@ -2,28 +2,33 @@
 models/decoder.py - Scalable Ultra-Lightweight Decoder / Prediction Network for ZipTransducer-Tamil
 ==================================================================================================
 Multi-Variant Decoder Family (Small, Medium, Large):
-1. Small (~1.13M - 1.74M decoder params):
-   - Encoder Dim: 256, Pred Dim: 384, Joint Dim: 384, Embed Dim: 384
-   - Total model with Small Encoder: ~10.5M params
-2. Medium (~2.0M - 2.89M decoder params):
-   - Encoder Dim: 512, Pred Dim: 512, Joint Dim: 512, Embed Dim: 512
-   - Total model with Medium Encoder: ~50M params
-3. Large (~3.0M - 4.23M decoder params):
-   - Encoder Dim: 768, Pred Dim: 640, Joint Dim: 640, Embed Dim: 640
-   - Total model with Large Encoder: ~115M params
+1. Small (~1.42M decoder params @ V=431):
+   - Encoder Dim: 256, Pred Dim: 384, Joint Dim: 384, Embed Dim: 384, Context: K=4
+   - Total model with Small Encoder: ~10.7M params
+2. Medium (~2.50M decoder params @ V=431):
+   - Encoder Dim: 512, Pred Dim: 512, Joint Dim: 512, Embed Dim: 512, Context: K=4
+   - Total model with Medium Encoder: ~51.7M params
+3. Large (~3.83M decoder params @ V=431):
+   - Encoder Dim: 768, Pred Dim: 640, Joint Dim: 640, Embed Dim: 640, Context: K=4
+   - Total model with Large Encoder: ~116.1M params
 
 Core Innovations & Stability Formulations:
-- Stateless Predictor: Embedding + Causal Conv1D (k=2) + RMSNorm + SiLU + Linear + RMSNorm.
+- Stateless Predictor: Embedding + Causal Conv1D (k=4) + RMSNorm + SiLU + Linear + RMSNorm.
   Zero recurrent state, O(1) memory, O(U) parallel training.
+  padding_idx set to pad_id (1), blank_id (0) embedding is learned as the <blank> SOS symbol.
+  Context window K=4 captures rich Tamil agglutinative morphemes.
 - Optimized Joint Network: Linear_enc + Linear_pred -> tanh -> Linear_out.
-  Supports full 4D joint training, fast single-step decoding (B x V), and pruned lattice evaluation.
+  Supports full 4D joint training, precomputed acoustic projection forward_step_with_proj,
+  fast single-step decoding (B x V), and pruned lattice evaluation.
 - Auxiliary CTC Head: RMSNorm -> Dropout -> Linear with blank penalty & label smoothing.
+  CTC loss scale aligned with RNN-T via sample-level mean reduction (reduction="none" -> mean).
 - Dual-Mode Inference: Streaming 1-pass CTC Greedy (RTF < 0.003) & Transducer Greedy / Beam Search.
 - Custom GPU Triton acceleration hooks for fused tanh, RMSNorm, log-softmax, and CTC decode.
 - Production FP16 / AMP Numerical Stability Guarantee:
   * Autocast exit for both RNN-T and CTC loss (computed strictly in float32).
   * Strict logit clamping [-30.0, 30.0] to prevent exponent overflow in early random initialization.
   * CTC Length Sanitization: enforces encoder_lengths >= target_lengths, preventing +inf loss.
+  * Explicit RuntimeError on torchaudio rnnt_loss failures (no silent fallbacks).
   * NaN / Inf safety guards returning finite gradient anchors under degenerate batches.
 """
 
@@ -68,9 +73,10 @@ class DecoderConfig:
     embed_dim: int = 384
     pred_dim: int = 384
     joint_dim: int = 384
-    context_size: int = 2
+    context_size: int = 4            # Context window K=4 to capture full Tamil agglutinative morphemes
     dropout: float = 0.1
     blank_id: int = 0
+    pad_id: int = 1                  # Tokenizer pad_id=1 (padding_idx for embedding)
     predictor_mode: str = "stateless"
     ctc_weight: float = 0.25
     blank_penalty: float = 0.1
@@ -79,39 +85,42 @@ class DecoderConfig:
 
     @classmethod
     def small(cls, vocab_size: int = 1024, **kwargs) -> "DecoderConfig":
-        """Small: encoder_dim=256, pred_dim=384, joint_dim=384 (~1.13M - 1.74M params)."""
+        """Small: encoder_dim=256, pred_dim=384, joint_dim=384, context_size=4."""
         return cls(
             vocab_size=vocab_size,
             encoder_dim=256,
             embed_dim=384,
             pred_dim=384,
             joint_dim=384,
+            context_size=4,
             variant="small",
             **kwargs,
         )
 
     @classmethod
     def medium(cls, vocab_size: int = 1024, **kwargs) -> "DecoderConfig":
-        """Medium: encoder_dim=512, pred_dim=512, joint_dim=512 (~1.98M - 2.89M params)."""
+        """Medium: encoder_dim=512, pred_dim=512, joint_dim=512, context_size=4."""
         return cls(
             vocab_size=vocab_size,
             encoder_dim=512,
             embed_dim=512,
             pred_dim=512,
             joint_dim=512,
+            context_size=4,
             variant="medium",
             **kwargs,
         )
 
     @classmethod
     def large(cls, vocab_size: int = 1024, **kwargs) -> "DecoderConfig":
-        """Large: encoder_dim=768, pred_dim=640, joint_dim=640 (~3.02M - 4.23M params)."""
+        """Large: encoder_dim=768, pred_dim=640, joint_dim=640, context_size=4."""
         return cls(
             vocab_size=vocab_size,
             encoder_dim=768,
             embed_dim=640,
             pred_dim=640,
             joint_dim=640,
+            context_size=4,
             variant="large",
             **kwargs,
         )
@@ -156,7 +165,7 @@ class CausalConv1d(nn.Module):
         self,
         in_channels: int,
         out_channels: int,
-        kernel_size: int = 2,
+        kernel_size: int = 4,
         stride: int = 1,
         dilation: int = 1,
         groups: int = 1,
@@ -200,7 +209,8 @@ class StatelessPredictionNetwork(nn.Module):
     Stateless Prediction Network (Povey / Zipformer style).
     
     Architecture:
-    1. Embedding: (vocab_size, embed_dim)
+    1. Embedding: (vocab_size, embed_dim, padding_idx=pad_id)
+       - padding_idx set to pad_id (1), blank_id (0) embedding is learned as the <blank> SOS token.
     2. Causal Conv1d: (embed_dim, output_dim, kernel=context_size)
     3. RMSNorm(output_dim)
     4. SiLU() activation
@@ -216,9 +226,10 @@ class StatelessPredictionNetwork(nn.Module):
         vocab_size: int = 1024,
         embed_dim: int = 384,
         output_dim: int = 384,
-        context_size: int = 2,
+        context_size: int = 4,
         dropout: float = 0.1,
         blank_id: int = 0,
+        pad_id: int = 1,
     ):
         super().__init__()
         self.vocab_size = vocab_size
@@ -226,11 +237,12 @@ class StatelessPredictionNetwork(nn.Module):
         self.output_dim = output_dim
         self.context_size = context_size
         self.blank_id = blank_id
+        self.pad_id = pad_id
 
-        # Token embedding
-        self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=blank_id)
+        # Token embedding: padding_idx=pad_id (1), blank_id (0) is learned as SOS symbol
+        self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=pad_id)
 
-        # Causal Conv1d over token history (K=2)
+        # Causal Conv1d over token history (K=context_size)
         self.causal_conv = CausalConv1d(
             in_channels=embed_dim,
             out_channels=output_dim,
@@ -250,8 +262,10 @@ class StatelessPredictionNetwork(nn.Module):
 
     def _reset_parameters(self):
         nn.init.normal_(self.embedding.weight, mean=0.0, std=self.embed_dim ** -0.5)
+        # Ensure pad_id embedding is zeroed, but blank_id (0) is learned
         with torch.no_grad():
-            self.embedding.weight[self.blank_id].fill_(0.0)
+            if self.pad_id is not None and self.pad_id < self.vocab_size:
+                self.embedding.weight[self.pad_id].fill_(0.0)
         nn.init.xavier_uniform_(self.linear.weight)
         nn.init.zeros_(self.linear.bias)
 
@@ -322,14 +336,16 @@ class LightweightRNNPredictionNetwork(nn.Module):
         hidden_dim: int = 384,
         dropout: float = 0.1,
         blank_id: int = 0,
+        pad_id: int = 1,
     ):
         super().__init__()
         self.vocab_size = vocab_size
         self.embed_dim = embed_dim
         self.hidden_dim = hidden_dim
         self.blank_id = blank_id
+        self.pad_id = pad_id
 
-        self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=blank_id)
+        self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=pad_id)
         self.gru = nn.GRU(
             input_size=embed_dim,
             hidden_size=hidden_dim,
@@ -437,6 +453,22 @@ class JointNetwork(nn.Module):
         logits = self.out_proj(joint)
         return logits
 
+    def forward_step_with_proj(
+        self,
+        enc_z_step: torch.Tensor,
+        predictor_step: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Fast single-step joint computation when encoder projection is already precomputed.
+        enc_z_step: (Batch, joint_dim) or (1, joint_dim)
+        predictor_step: (Batch, pred_dim) or (1, pred_dim)
+        Returns: logits (Batch, vocab_size)
+        """
+        pred_z = self.pred_proj(predictor_step)
+        joint = torch.tanh(enc_z_step + pred_z)
+        logits = self.out_proj(joint)
+        return logits
+
     def forward_pruned(
         self,
         encoder_outputs: torch.Tensor,
@@ -465,7 +497,7 @@ class JointNetwork(nn.Module):
 
 
 # ==============================================================================
-# 6. Auxiliary CTC Head (with FP16 Autocast Exit & Length Sanitization)
+# 6. Auxiliary CTC Head (with FP16 Autocast Exit, Length Sanitization & Aligned Reduction)
 # ==============================================================================
 
 class AuxiliaryCTCHead(nn.Module):
@@ -476,6 +508,7 @@ class AuxiliaryCTCHead(nn.Module):
     - Autocast Exit: Computes CTC loss strictly in float32.
     - Logit Clamping: Clamps logits to [-30.0, 30.0] preventing exp overflow in early weights.
     - Length Sanitization: Enforces encoder_lengths >= target_lengths, preventing inf loss.
+    - Loss Scale Alignment: Uses reduction="none" -> mean() to match RNN-T sample-level scaling.
     - Blank Penalty: Suppresses blank dominance for complex agglutinative Tamil tokens.
     - NaN/Inf Guard: Recovers gracefully with finite gradients if degenerate batch occurs.
     """
@@ -524,9 +557,8 @@ class AuxiliaryCTCHead(nn.Module):
     ) -> torch.Tensor:
         """
         Computes CTC loss with full FP16/AMP numerical stability, length sanitization,
-        and NaN protection.
+        and aligned sample-level reduction scale.
         """
-        # Always exit autocast to ensure float32 accuracy during CTC recursion
         is_cuda = logits.is_cuda
         autocast_ctx = torch.amp.autocast(device_type="cuda" if is_cuda else "cpu", enabled=False)
 
@@ -551,16 +583,17 @@ class AuxiliaryCTCHead(nn.Module):
             else:
                 log_probs = F.log_softmax(logits_f32, dim=-1).transpose(0, 1)
 
-            # 5. Native CTC Loss
-            loss = F.ctc_loss(
+            # 5. Native CTC Loss: reduction="none" -> mean() aligns reduction scale with RNN-T
+            loss_per_item = F.ctc_loss(
                 log_probs=log_probs,
                 targets=targets.to(dtype=torch.long),
                 input_lengths=safe_input_lens,
                 target_lengths=safe_target_lens,
                 blank=self.blank_id,
-                reduction="mean",
+                reduction="none",
                 zero_infinity=True,
             )
+            loss = loss_per_item.mean()
 
             # 6. Optional label smoothing
             if label_smoothing > 0.0:
@@ -581,10 +614,10 @@ class AuxiliaryCTCHead(nn.Module):
     ) -> List[List[int]]:
         """
         1-pass CTC greedy decoding: argmax -> collapse repeats -> remove blank.
-        Uses fast_ctc_greedy_decode on GPU.
+        Uses fast_ctc_greedy_decode on GPU with input_lengths padding mask.
         """
         if HAS_TRITON_OPS and logits.is_cuda and is_triton_available():
-            decoded_tensors = fast_ctc_greedy_decode(logits, blank_id=self.blank_id)
+            decoded_tensors = fast_ctc_greedy_decode(logits, blank_id=self.blank_id, input_lengths=input_lengths)
             return [t.tolist() for t in decoded_tensors]
 
         batch_size, time_steps, _ = logits.shape
@@ -607,13 +640,13 @@ class AuxiliaryCTCHead(nn.Module):
 
 
 # ==============================================================================
-# 7. Multi-Task Loss Formulation (with FP16 Autocast Exit & NaN Protection)
+# 7. Multi-Task Loss Formulation (with FP16 Autocast Exit & Explicit Error)
 # ==============================================================================
 
 class TransducerLoss(nn.Module):
     """
     Transducer (RNN-T) Loss wrapper with FP16 autocast exit, logit clamping,
-    safe length validation, and NaN protection.
+    safe length validation, and explicit error raising (no silent fallbacks).
     """
     def __init__(self, blank_id: int = 0, clamp: float = 1e-4):
         super().__init__()
@@ -652,13 +685,13 @@ class TransducerLoss(nn.Module):
                         reduction="mean",
                         fused_log_softmax=True,
                     )
-                except Exception:
-                    # Fallback on torchaudio execution error
-                    log_probs = F.log_softmax(logits_f32, dim=-1)
-                    loss = -log_probs.mean()
+                except Exception as e:
+                    raise RuntimeError(f"torchaudio.functional.rnnt_loss execution failed: {e}") from e
             else:
-                log_probs = F.log_softmax(logits_f32, dim=-1)
-                loss = -log_probs.mean()
+                raise RuntimeError(
+                    "torchaudio.functional.rnnt_loss is required for Transducer training but is not available. "
+                    "Please install a compatible torchaudio version."
+                )
 
             # 3. NaN/Inf Guard
             if torch.isnan(loss) or torch.isinf(loss):
@@ -733,7 +766,7 @@ class JointCTCTransducerLoss(nn.Module):
 class UltraLightweightDecoder(nn.Module):
     """
     Scalable Ultra-Lightweight Decoder / Prediction Network for ZipTransducer-Tamil.
-    Supports Small (~1.13M - 1.74M), Medium (~2.0M - 2.89M), and Large (~3.0M - 4.23M) configurations.
+    Supports Small, Medium, and Large configurations.
     """
     def __init__(
         self,
@@ -743,9 +776,10 @@ class UltraLightweightDecoder(nn.Module):
         embed_dim: int = 384,
         pred_dim: int = 384,
         joint_dim: int = 384,
-        context_size: int = 2,
+        context_size: int = 4,
         dropout: float = 0.1,
         blank_id: int = 0,
+        pad_id: int = 1,
         predictor_mode: str = "stateless",
         ctc_weight: float = 0.25,
         blank_penalty: float = 0.1,
@@ -764,6 +798,7 @@ class UltraLightweightDecoder(nn.Module):
                 context_size=context_size,
                 dropout=dropout,
                 blank_id=blank_id,
+                pad_id=pad_id,
                 predictor_mode=predictor_mode,
                 ctc_weight=ctc_weight,
                 blank_penalty=blank_penalty,
@@ -777,6 +812,7 @@ class UltraLightweightDecoder(nn.Module):
         self.joint_dim = self.config.joint_dim
         self.context_size = self.config.context_size
         self.blank_id = self.config.blank_id
+        self.pad_id = getattr(self.config, "pad_id", 1)
         self.predictor_mode = self.config.predictor_mode
 
         # 1. Stateless Prediction Network
@@ -788,6 +824,7 @@ class UltraLightweightDecoder(nn.Module):
                 context_size=self.context_size,
                 dropout=self.config.dropout,
                 blank_id=self.blank_id,
+                pad_id=self.pad_id,
             )
         elif self.predictor_mode == "rnn":
             self.predictor = LightweightRNNPredictionNetwork(
@@ -796,6 +833,7 @@ class UltraLightweightDecoder(nn.Module):
                 hidden_dim=self.pred_dim,
                 dropout=self.config.dropout,
                 blank_id=self.blank_id,
+                pad_id=self.pad_id,
             )
         else:
             raise ValueError(f"Unknown predictor mode: {self.predictor_mode}")
@@ -880,6 +918,7 @@ class UltraLightweightDecoder(nn.Module):
     ) -> List[List[int]]:
         """
         Ultra-fast 1-pass CTC greedy decoding (RTF < 0.003).
+        Passes encoder_lengths to mask out padded frames.
         """
         ctc_logits = self.ctc_head(encoder_outputs)
         return self.ctc_head.decode_greedy(ctc_logits, encoder_lengths)
@@ -893,18 +932,21 @@ class UltraLightweightDecoder(nn.Module):
     ) -> List[List[int]]:
         """
         Frame-synchronous Transducer Greedy Search with Stateless Caching.
+        Precomputes acoustic projection enc_proj_all once outside the frame loop.
         """
         batch_size, time_steps, _ = encoder_outputs.shape
-        results = []
+        # Precompute acoustic projection once for all frames
+        enc_proj_all = self.joint.enc_proj(encoder_outputs)  # (Batch, T, joint_dim)
 
+        results = []
         for b in range(batch_size):
             t_max = encoder_lengths[b].item() if encoder_lengths is not None else time_steps
-            enc_b = encoder_outputs[b]
+            enc_proj_b = enc_proj_all[b]  # (T, joint_dim)
 
             hyp = [self.blank_id]
 
             for t in range(t_max):
-                enc_t = enc_b[t:t+1]
+                enc_z_t = enc_proj_b[t:t+1]  # (1, joint_dim)
                 symbols_emitted = 0
 
                 while symbols_emitted < max_symbols_per_step:
@@ -920,7 +962,7 @@ class UltraLightweightDecoder(nn.Module):
                         pred_step, _ = self.predictor(token)
                         pred_step = pred_step.squeeze(1)
 
-                    logits = self.joint.forward_step(enc_t, pred_step)
+                    logits = self.joint.forward_step_with_proj(enc_z_t, pred_step)
                     best_token = torch.argmax(logits, dim=-1).item()
 
                     if best_token == self.blank_id:
@@ -943,18 +985,20 @@ class UltraLightweightDecoder(nn.Module):
     ) -> List[List[int]]:
         """
         Lightweight Transducer Beam Search with Stateless Context Lookback.
+        Precomputes acoustic projection enc_proj_all once outside the frame loop.
         """
         batch_size, time_steps, _ = encoder_outputs.shape
-        results = []
+        enc_proj_all = self.joint.enc_proj(encoder_outputs)
 
+        results = []
         for b in range(batch_size):
             t_max = encoder_lengths[b].item() if encoder_lengths is not None else time_steps
-            enc_b = encoder_outputs[b]
+            enc_proj_b = enc_proj_all[b]
 
             beam: List[Tuple[float, List[int]]] = [(0.0, [self.blank_id])]
 
             for t in range(t_max):
-                enc_t = enc_b[t:t+1]
+                enc_z_t = enc_proj_b[t:t+1]
 
                 for _ in range(max_symbols_per_step):
                     new_beam = {}
@@ -972,7 +1016,7 @@ class UltraLightweightDecoder(nn.Module):
                             pred_step, _ = self.predictor(tok)
                             pred_step = pred_step.squeeze(1)
 
-                        logits = self.joint.forward_step(enc_t, pred_step)
+                        logits = self.joint.forward_step_with_proj(enc_z_t, pred_step)
                         log_probs = F.log_softmax(logits, dim=-1)[0]
 
                         top_probs, top_indices = torch.topk(log_probs, k=min(beam_size + 1, self.vocab_size))
@@ -1047,9 +1091,9 @@ def build_decoder(
 ) -> UltraLightweightDecoder:
     """
     Factory builder for ZipTransducer-Tamil Decoder family:
-    - 'small':  encoder_dim=256, pred_dim=384, joint_dim=384 (~1.74M params @ 1024, ~1.13M @ 431)
-    - 'medium': encoder_dim=512, pred_dim=512, joint_dim=512 (~2.89M params @ 1024, ~1.98M @ 431)
-    - 'large':  encoder_dim=768, pred_dim=640, joint_dim=640 (~4.23M params @ 1024, ~3.02M @ 431)
+    - 'small':  encoder_dim=256, pred_dim=384, joint_dim=384, context_size=4
+    - 'medium': encoder_dim=512, pred_dim=512, joint_dim=512, context_size=4
+    - 'large':  encoder_dim=768, pred_dim=640, joint_dim=640, context_size=4
     """
     if variant == "small":
         cfg = DecoderConfig.small(vocab_size=vocab_size, **kwargs)
@@ -1095,11 +1139,17 @@ if __name__ == "__main__":
     res_l["loss"].backward()
     print("Large backward pass verified successfully!")
 
+    print("\nVerifying that <blank> (0) embedding weight is learned (requires_grad and non-zero):")
+    self_embed = m_dec.predictor.embedding.weight
+    print(f"Embedding shape: {self_embed.shape}, Blank norm: {self_embed[0].norm().item():.4f}, Pad norm: {self_embed[1].norm().item():.4f}")
+    assert self_embed[0].norm().item() > 0.0, "Blank embedding was zeroed!"
+    assert self_embed[1].norm().item() == 0.0, "Pad embedding was not zeroed!"
+
     print("\nVerifying FP16/AMP stability & safe length validation under extreme logits...")
-    extreme_logits = torch.randn(2, 20, 431).half() * 25.0  # Would overflow standard half exp
-    targets_overflow = torch.randint(1, 431, (2, 25), dtype=torch.long)  # target_len > input_len!
+    extreme_logits = torch.randn(2, 20, 431).half() * 25.0
+    targets_overflow = torch.randint(1, 431, (2, 25), dtype=torch.long)
     in_lens_short = torch.tensor([15, 10], dtype=torch.int32)
-    tgt_lens_long = torch.tensor([25, 20], dtype=torch.int32)  # T < U!
+    tgt_lens_long = torch.tensor([25, 20], dtype=torch.int32)
 
     ctc_safe_loss = m_dec.ctc_head.compute_loss(extreme_logits, targets_overflow, in_lens_short, tgt_lens_long)
     print(f"CTC Safe Loss with T < U and extreme FP16 logits: {ctc_safe_loss.item():.4f} (Finite: {not math.isnan(ctc_safe_loss.item()) and not math.isinf(ctc_safe_loss.item())})")

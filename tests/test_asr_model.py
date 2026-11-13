@@ -6,8 +6,15 @@ from models.asr_model import build_ultra_compact_tamil_asr, UltraCompactTamilASR
 
 
 class TestUltraCompactTamilASR(unittest.TestCase):
-    def setUp(self):
-        self.model = build_ultra_compact_tamil_asr()
+    @classmethod
+    def setUpClass(cls):
+        cls.model = build_ultra_compact_tamil_asr()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.model = None
+        import gc
+        gc.collect()
 
     def test_parameter_budget(self):
         breakdown = self.model.get_parameter_breakdown()
@@ -48,10 +55,28 @@ class TestUltraCompactTamilASR(unittest.TestCase):
 
         # Backward pass gradient verification
         out["loss"].backward()
-        for param in self.model.parameters():
-            if param.grad is not None:
-                self.assertFalse(torch.isnan(param.grad).any())
-                self.assertFalse(torch.isinf(param.grad).any())
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                self.assertIsNotNone(param.grad, f"Parameter {name} has None gradient!")
+                self.assertFalse(torch.isnan(param.grad).any(), f"Parameter {name} has NaN gradient!")
+                self.assertFalse(torch.isinf(param.grad).any(), f"Parameter {name} has Inf gradient!")
+
+        # Explicit non-zero gradient flow checks (auditing CTC, predictor, and encoder)
+        self.assertGreater(
+            self.model.decoder.ctc_head.head.weight.grad.abs().sum().item(),
+            0.0,
+            "CTC Head weight received zero gradient!",
+        )
+        self.assertGreater(
+            self.model.decoder.predictor.causal_conv.conv.weight.grad.abs().sum().item(),
+            0.0,
+            "Predictor conv weight received zero gradient!",
+        )
+        self.assertGreater(
+            self.model.encoder.stem.stage1_dw.weight.grad.abs().sum().item(),
+            0.0,
+            "Encoder stem weight received zero gradient!",
+        )
 
     def test_inference_transcription(self):
         B, C, T = 1, 80, 100

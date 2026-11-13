@@ -138,7 +138,8 @@ def test_fused_log_softmax_and_ctc():
     max_lse_err = (lse - 0.0).abs().max().item()
     assert max_lse_err < 1e-4
 
-    # Test CTC loss
+    # Test CTC loss and backward gradient flow (P0-1 fix)
+    logits.requires_grad_(True)
     targets = torch.randint(1, V, (B, 20), device=device, dtype=torch.long)
     input_lens = torch.full((B,), T, device=device, dtype=torch.long)
     target_lens = torch.full((B,), 20, device=device, dtype=torch.long)
@@ -146,13 +147,17 @@ def test_fused_log_softmax_and_ctc():
     loss = fused_ctc_loss(logits, targets, input_lens, target_lens, blank=0)
     assert loss.ndim == 0
     assert not torch.isnan(loss) and not torch.isinf(loss)
+    loss.backward()
+    assert logits.grad is not None, "P0-1 Failure: fused_log_softmax broke autograd graph for CTC loss!"
+    assert not torch.isnan(logits.grad).any(), "NaN detected in CTC loss gradient!"
 
 
 def test_fast_ctc_greedy_decode():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     B, T, V = 2, 50, 1024
     logits = torch.randn(B, T, V, device=device)
-    decoded = fast_ctc_greedy_decode(logits, blank_id=0)
+    input_lens = torch.tensor([35, 20], device=device, dtype=torch.long)
+    decoded = fast_ctc_greedy_decode(logits, blank_id=0, input_lengths=input_lens)
 
     assert len(decoded) == B
     for seq in decoded:

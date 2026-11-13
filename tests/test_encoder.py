@@ -32,6 +32,10 @@ class TestUltraCompactEncoder(unittest.TestCase):
     def setUp(self):
         torch.manual_seed(42)
 
+    def tearDown(self):
+        import gc
+        gc.collect()
+
     def test_rmsnorm(self):
         norm = RMSNorm(256)
         x = torch.randn(2, 50, 256)
@@ -111,6 +115,9 @@ class TestUltraCompactEncoder(unittest.TestCase):
             out, out_lens = model(x, lens)
             self.assertEqual(out.shape, (1, 100, exp["dim"]))
             self.assertEqual(out_lens.tolist(), [100])
+            del model, out, out_lens, x, lens
+            import gc
+            gc.collect()
 
     def test_small_forward_backward_gradient_integrity(self):
         model = build_encoder(variant="small")
@@ -127,6 +134,20 @@ class TestUltraCompactEncoder(unittest.TestCase):
         for name, param in model.named_parameters():
             self.assertIsNotNone(param.grad, f"Parameter {name} did not receive gradients")
             self.assertFalse(torch.isnan(param.grad).any(), f"Parameter {name} has NaN gradients")
+
+    def test_padding_mask_zeroing_and_isolation(self):
+        """[P1-2] Test that padded positions are strictly zeroed out and do not leak."""
+        model = build_encoder(variant="small")
+        model.eval()
+        x = torch.randn(2, 400, 80)
+        lens = torch.tensor([300, 200])
+        
+        with torch.no_grad():
+            out, out_lens = model(x, lens)
+            
+        t1, t2 = out_lens[0].item(), out_lens[1].item()
+        self.assertTrue((out[0, t1:] == 0.0).all().item(), "Padded frames in batch 0 are not zeroed")
+        self.assertTrue((out[1, t2:] == 0.0).all().item(), "Padded frames in batch 1 are not zeroed")
 
 
 if __name__ == "__main__":

@@ -48,8 +48,12 @@ COMPOSITE_VOWEL_REPLACEMENTS = [
 # Dependent Vowel Signs: \u0BBE-\u0BD7 (ா, ி, ீ, ு, ூ, ெ, ே, ை, ொ, ோ, ௌ, ், ௗ)
 # Virama / Pulli: \u0BCD (்)
 # Special Ligature Sri: \u0BB8\u0BCD\u0BB0\u0BC0 (ஸ்ரீ)
+# Special Conjunct Ksha: \u0B95\u0BCD\u0BB7 (க்ஷ)
 AKSHARA_PATTERN = re.compile(
     r"\u0BB8\u0BCD\u0BB0\u0BC0"              # Grantha ligature: ஸ்ரீ
+    r"|\u0B95\u0BCD\u0BB7\u0BCD"            # க்ஷ் (virama)
+    r"|\u0B95\u0BCD\u0BB7[\u0BBE-\u0BD7]"  # க்ஷ + dependent vowel signs
+    r"|\u0B95\u0BCD\u0BB7"                  # க்ஷ base
     r"|[\u0B95-\u0BB9]\u0BCD"               # Consonant + Virama (மெய்: க், ச், ட், த், etc.)
     r"|[\u0B95-\u0BB9][\u0BBE-\u0BD7]"      # Consonant + Dependent Vowel (உயிர்மெய்: கா, மி, டு, etc.)
     r"|[\u0B95-\u0BB9]"                     # Standalone Consonant with inherent 'a' (க, ச, etc.)
