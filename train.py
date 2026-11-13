@@ -74,7 +74,7 @@ class ExperimentTracker:
                 from torch.utils.tensorboard import SummaryWriter
                 tb_log_dir = os.path.join(args.tensorboard_dir, f"zip_transducer_{args.variant}_{int(time.time())}")
                 os.makedirs(tb_log_dir, exist_ok=True)
-                self.tb_writer = SummaryWriter(log_dir=tb_log_dir)
+                self.tb_writer = SummaryWriter(log_dir=tb_log_dir, flush_secs=2)
                 logger.info(f"TensorBoard logging active at: {tb_log_dir}")
             except Exception as e:
                 logger.warning(f"Could not initialize TensorBoard ({e})")
@@ -113,6 +113,7 @@ class ExperimentTracker:
         if self.tb_writer is not None:
             for k, v in metrics.items():
                 self.tb_writer.add_scalar(k, v, step)
+            self.tb_writer.flush()
         if self.use_mlflow:
             try:
                 import mlflow
@@ -131,6 +132,7 @@ class ExperimentTracker:
             return
         if self.tb_writer is not None:
             self.tb_writer.add_text(tag, text, step)
+            self.tb_writer.flush()
         if self.use_wandb:
             try:
                 import wandb
