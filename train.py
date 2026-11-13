@@ -167,8 +167,9 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Train ZipTransducer-Tamil on Dual Tesla T4 GPUs")
     parser.add_argument("--variant", type=str, default="medium", choices=["small", "medium", "large"],
                         help="Model variant: small (~10.5M), medium (~51.2M), large (~115.3M)")
-    parser.add_argument("--batch-size", type=int, default=16, help="Batch size per GPU (default: 16 per T4 -> 32 total across 2x T4)")
-    parser.add_argument("--grad-accum", type=int, default=8, help="Gradient accumulation steps (effective batch: 256 utterances)")
+    parser.add_argument("--batch-size", type=int, default=8, help="Batch size per GPU (default: 8 per T4 -> 16 total across 2x T4, safe against 4D RNN-T VRAM spikes)")
+    parser.add_argument("--grad-accum", type=int, default=16, help="Gradient accumulation steps (effective batch: 256 utterances)")
+    parser.add_argument("--max-duration", type=float, default=12.0, help="Maximum audio duration in seconds to cap 4D joint tensor memory")
     parser.add_argument("--lr", type=float, default=5e-4, help="Peak learning rate for AdamW")
     parser.add_argument("--min-lr", type=float, default=1e-5, help="Minimum learning rate")
     parser.add_argument("--weight-decay", type=float, default=1e-2, help="Weight decay for AdamW")
@@ -183,7 +184,7 @@ def parse_args():
     parser.add_argument("--mock-data", action="store_true", default=False, help="Use synthetic data stream for offline testing")
     parser.add_argument("--hf-token", type=str, default=None, nargs="?", const="", help="Hugging Face access token")
     parser.add_argument("--checkpoint-dir", type=str, default="./checkpoints", help="Directory to save checkpoints")
-    parser.add_argument("--save-every", type=int, default=1000, help="Checkpoint frequency (steps)")
+    parser.add_argument("--save-every", type=int, default=500, help="Checkpoint frequency (steps)")
     parser.add_argument("--log-every", type=int, default=25, help="Logging frequency (steps)")
     parser.add_argument("--eval-every", type=int, default=500, help="Validation preview frequency (steps)")
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume")
@@ -284,7 +285,7 @@ def train_worker(rank: int, world_size: int, args: argparse.Namespace):
         tokenizer=tokenizer,
         apply_spec_augment=True,
         min_duration=0.5,
-        max_duration=15.0,  # Cap at 15.0s to prevent outlier 25s+ utterances from blowing up the 4D joint tensor
+        max_duration=args.max_duration,  # Cap duration (default: 12.0s) to keep 4D RNN-T joint memory safe
         shuffle_buffer_size=args.shuffle_buffer,
         mock_streaming=args.mock_data,
     )
@@ -319,13 +320,28 @@ def train_worker(rank: int, world_size: int, args: argparse.Namespace):
     scheduler = get_cosine_schedule_with_warmup(optimizer, args.warmup_steps, args.max_steps)
 
     start_step = 0
-    if args.resume and os.path.exists(args.resume):
+    resume_path = args.resume
+    if not resume_path and os.path.exists(args.checkpoint_dir):
+        existing_ckpts = sorted(
+            Path(args.checkpoint_dir).glob(f"zip_transducer_{args.variant}_step_*.pt"),
+            key=lambda p: int(p.stem.split("_step_")[-1]) if p.stem.split("_step_")[-1].isdigit() else 0
+        )
+        if existing_ckpts:
+            resume_path = str(existing_ckpts[-1])
+            if is_main:
+                logger.info(f"Auto-discovered previous checkpoint: {resume_path}")
+
+    if resume_path and os.path.exists(resume_path):
         if is_main:
-            logger.info(f"Resuming checkpoint from {args.resume}")
-        ckpt = torch.load(args.resume, map_location=device)
+            logger.info(f"Resuming checkpoint from {resume_path}")
+        ckpt = torch.load(resume_path, map_location=device)
         raw_model.load_state_dict(ckpt["model_state_dict"])
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
         start_step = ckpt.get("step", 0)
+        for _ in range(start_step):
+            scheduler.step()
+        if is_main:
+            logger.info(f"Resumed at step {start_step} with LR: {scheduler.get_last_lr()[0]:.2e}")
 
     # 4. Training Loop
     model.train()
@@ -433,6 +449,10 @@ def train_worker(rank: int, world_size: int, args: argparse.Namespace):
             running_audio_sec = 0.0
             t_start = time.time()
 
+        # Periodic VRAM Cache Defragmentation
+        if step % 200 == 0 and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
         # Validation Preview
         if is_main and step % args.eval_every == 0:
             model.eval()
@@ -447,6 +467,8 @@ def train_worker(rank: int, world_size: int, args: argparse.Namespace):
                     preview_text += f"Target: {gold}\nPred:   {preds_ctc[i]}\n\n"
                 logger.info("--------------------------------")
                 tracker.log_text("Preview/transcriptions", preview_text, step=step)
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             model.train()
 
         # Save Checkpoint

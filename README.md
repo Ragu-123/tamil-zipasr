@@ -93,15 +93,18 @@ print("Transducer:", rnnt_transcription)
 ```bash
 torchrun --nproc_per_node=2 train.py \
   --variant medium \
-  --batch-size 32 \
-  --grad-accum 4 \
+  --batch-size 8 \
+  --grad-accum 16 \
+  --max-duration 12.0 \
   --lr 5e-4 \
   --warmup-steps 1500 \
   --max-steps 16520 \
   --fp16 \
   --checkpoint-dir /kaggle/working/checkpoints \
-  --save-every 1000 \
-  --log-every 25
+  --tensorboard-dir /kaggle/working/tensorboard \
+  --save-every 500 \
+  --log-every 25 \
+  --eval-every 500
 ```
 
 ### 🌐 Live Dashboard Monitoring (via Cloudflare Quick Tunnel)
