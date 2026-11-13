@@ -358,10 +358,13 @@ def train_worker(rank: int, world_size: int, args: argparse.Namespace):
         if (step + 1) % args.grad_accum == 0:
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad)
+            scale_before = scaler.get_scale() if hasattr(scaler, "get_scale") else 1.0
             scaler.step(optimizer)
             scaler.update()
+            scale_after = scaler.get_scale() if hasattr(scaler, "get_scale") else 1.0
+            if scale_before <= scale_after:
+                scheduler.step()
             optimizer.zero_grad()
-            scheduler.step()
 
         step += 1
 
