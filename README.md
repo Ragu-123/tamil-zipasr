@@ -89,15 +89,43 @@ rnnt_transcription = model.transcribe(audio_features, method="transducer")
 print("Transducer:", rnnt_transcription)
 ```
 
-### Streaming Training
+### Streaming Training on Dual Tesla T4 (T4 x 2)
 ```bash
-python train.py \
-  --variant small \
-  --batch-size 8 \
-  --grad-accum 2 \
+torchrun --nproc_per_node=2 train.py \
+  --variant medium \
+  --batch-size 32 \
+  --grad-accum 4 \
   --lr 5e-4 \
-  --max-steps 20000 \
-  --fp16
+  --warmup-steps 1500 \
+  --max-steps 16520 \
+  --fp16 \
+  --checkpoint-dir /kaggle/working/checkpoints \
+  --save-every 1000 \
+  --log-every 25
+```
+
+### 🌐 Live Dashboard Monitoring (via Cloudflare Quick Tunnel)
+Monitor your training in real-time from your phone or browser with zero logins, accounts, or API keys:
+
+```bash
+# In a background cell or terminal in Kaggle:
+python serve_monitor.py --type tensorboard --logdir /kaggle/working/tensorboard --daemon
+```
+This automatically spins up TensorBoard, downloads `cloudflared`, and outputs a live public URL:
+```text
+========================================================================================
+           ZIPTRANSDUCER-TAMIL LIVE TRAINING DASHBOARD (CLOUDFLARE TUNNEL)
+========================================================================================
+  Backend:     TENSORBOARD (Local-First, No Accounts/Keys Required)
+  Log Dir:     /kaggle/working/tensorboard
+
+  >>> PUBLIC MONITORING LINK:
+  >>> https://xxxx-xxxx-xxxx.trycloudflare.com <<<
+
+  Open this URL on your browser/phone to monitor live loss, CER, WER, and throughput!
+========================================================================================
+```
+
 ```
 
 ---
