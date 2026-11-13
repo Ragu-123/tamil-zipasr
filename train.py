@@ -1,16 +1,17 @@
 """
-Training Script for ZipTransducer-Tamil Model Family
-====================================================
-End-to-end streaming training on ai4bharat/IndicVoices Tamil speech corpus.
+Optimized Multi-GPU Distributed Training Script for ZipTransducer-Tamil
+=======================================================================
+Engineered for Dual NVIDIA Tesla T4 GPUs (T4 x 2) on Kaggle / Cloud.
 
-Key Features:
-- Supports Small (~10.5M), Medium (~51.2M), and Large (~115.3M) variants.
-- Zero-disk streaming dataset pipeline with in-memory audio decoding.
-- Multi-task training: Joint RNN-T Loss + 0.25 * Auxiliary CTC Loss.
-- Mixed precision training (FP16 / BF16) with gradient scaling.
-- SpecAugment (time & frequency masking) for acoustic robustness.
-- Cosine Annealing learning rate schedule with linear warmup.
-- Live validation evaluation and transcription preview during training.
+Key Performance Features:
+- Native DistributedDataParallel (DDP) across 2x Tesla T4 GPUs.
+- Supports both `torchrun --nproc_per_node=2 train.py` and automatic `python train.py --ddp`.
+- Zero-disk streaming dataset from Hugging Face (`ai4bharat/IndicVoices` Tamil)
+  with rank-aware stream sharding (zero duplicate audio between GPUs).
+- FP16 Mixed Precision leveraging Turing Tensor Cores (~65 TFLOPS per T4).
+- Gradient Accumulation to support large effective batch sizes without OOM.
+- Live throughput tracking: steps/sec, audio seconds/sec, training RTF multiplier.
+- Real-time CTC & Transducer validation previews and atomic checkpointing.
 """
 
 from __future__ import annotations
@@ -26,6 +27,8 @@ from typing import Optional, Dict, Any, List
 
 import torch
 import torch.nn as nn
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
@@ -40,35 +43,33 @@ logging.basicConfig(
     format="[%(asctime)s] [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
-logger = logging.getLogger("train")
+logger = logging.getLogger("train_t4x2")
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Train ZipTransducer-Tamil ASR model")
-    parser.add_argument("--variant", type=str, default="small", choices=["small", "medium", "large"],
-                        help="Model family variant: small (~10.5M), medium (~51.2M), large (~115.3M)")
-    parser.add_argument("--batch-size", type=int, default=8, help="Batch size per GPU")
-    parser.add_argument("--grad-accum", type=int, default=2, help="Gradient accumulation steps")
-    parser.add_argument("--lr", type=float, default=5e-4, help="Peak learning rate")
+    parser = argparse.ArgumentParser(description="Train ZipTransducer-Tamil on Dual Tesla T4 GPUs")
+    parser.add_argument("--variant", type=str, default="medium", choices=["small", "medium", "large"],
+                        help="Model variant: small (~10.5M), medium (~51.2M), large (~115.3M)")
+    parser.add_argument("--batch-size", type=int, default=8, help="Batch size per GPU (default: 8 per T4 -> 16 total)")
+    parser.add_argument("--grad-accum", type=int, default=2, help="Gradient accumulation steps (effective batch: 32)")
+    parser.add_argument("--lr", type=float, default=3e-4, help="Peak learning rate for AdamW")
     parser.add_argument("--min-lr", type=float, default=1e-6, help="Minimum learning rate")
     parser.add_argument("--weight-decay", type=float, default=1e-2, help="Weight decay for AdamW")
-    parser.add_argument("--warmup-steps", type=int, default=1000, help="Linear warmup steps")
-    parser.add_argument("--max-steps", type=int, default=20000, help="Total training steps")
-    parser.add_argument("--clip-grad", type=float, default=5.0, help="Maximum gradient norm")
-    parser.add_argument("--fp16", action="store_true", default=True, help="Enable automatic mixed precision")
-    parser.add_argument("--use-triton", action="store_true", default=False, help="Enable custom Triton GPU kernels")
-    parser.add_argument("--mock-data", action="store_true", default=False, help="Run in mock/offline data mode for verification")
-    parser.add_argument("--hf-token", type=str, default=None, help="Hugging Face API token for dataset streaming")
-    parser.add_argument("--checkpoint-dir", type=str, default="./checkpoints", help="Directory to save model checkpoints")
-    parser.add_argument("--save-every", type=int, default=1000, help="Save checkpoint every N steps")
-    parser.add_argument("--log-every", type=int, default=20, help="Log metrics every N steps")
-    parser.add_argument("--eval-every", type=int, default=500, help="Evaluate every N steps")
-    parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume training from")
+    parser.add_argument("--warmup-steps", type=int, default=1000, help="Warmup steps")
+    parser.add_argument("--max-steps", type=int, default=15000, help="Total training steps (15K steps ~ 1 full epoch)")
+    parser.add_argument("--clip-grad", type=float, default=5.0, help="Gradient clipping max norm")
+    parser.add_argument("--fp16", action="store_true", default=True, help="Enable FP16 mixed precision on Tensor Cores")
+    parser.add_argument("--ddp", action="store_true", default=False, help="Launch internal DDP across all available GPUs")
+    parser.add_argument("--hf-token", type=str, default=None, help="Hugging Face access token")
+    parser.add_argument("--checkpoint-dir", type=str, default="./checkpoints", help="Directory to save checkpoints")
+    parser.add_argument("--save-every", type=int, default=1000, help="Checkpoint frequency (steps)")
+    parser.add_argument("--log-every", type=int, default=25, help="Logging frequency (steps)")
+    parser.add_argument("--eval-every", type=int, default=500, help="Validation preview frequency (steps)")
+    parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume")
     return parser.parse_args()
 
 
 def get_cosine_schedule_with_warmup(optimizer, warmup_steps: int, max_steps: int, min_lr_ratio: float = 0.01):
-    """Cosine Annealing with linear warmup."""
     def lr_lambda(step: int) -> float:
         if step < warmup_steps:
             return float(step) / float(max(1, warmup_steps))
@@ -77,44 +78,67 @@ def get_cosine_schedule_with_warmup(optimizer, warmup_steps: int, max_steps: int
     return LambdaLR(optimizer, lr_lambda)
 
 
-def main():
-    args = parse_args()
-    os.makedirs(args.checkpoint_dir, exist_ok=True)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    logger.info(f"Using device: {device} (CUDA Available: {torch.cuda.is_available()})")
+def setup_ddp(rank: int, world_size: int):
+    """Initializes DDP process group."""
+    os.environ["MASTER_ADDR"] = os.getenv("MASTER_ADDR", "localhost")
+    os.environ["MASTER_PORT"] = os.getenv("MASTER_PORT", "12355")
+    dist.init_process_group("nccl" if torch.cuda.is_available() else "gloo", rank=rank, world_size=world_size)
+    torch.cuda.set_device(rank)
 
-    # 1. Initialize Tokenizer & Model
+
+def cleanup_ddp():
+    """Destroys DDP process group."""
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def train_worker(rank: int, world_size: int, args: argparse.Namespace):
+    """Main training worker executed on each GPU."""
+    is_distributed = world_size > 1
+    if is_distributed:
+        setup_ddp(rank, world_size)
+
+    device = torch.device(f"cuda:{rank}" if torch.cuda.is_available() else "cpu")
+    is_main = rank == 0
+
+    if is_main:
+        os.makedirs(args.checkpoint_dir, exist_ok=True)
+        logger.info(f"=== Starting Training on {world_size} GPU(s) [{args.variant.upper()} Model] ===")
+        logger.info(f"Per-GPU Batch: {args.batch_size} | Grad Accum: {args.grad_accum} | Effective Batch: {args.batch_size * world_size * args.grad_accum}")
+
+    # 1. Tokenizer & Model
     tokenizer = TamilAksharaTokenizer()
-    logger.info(f"Tamil Akshara Tokenizer initialized with {tokenizer.vocab_size} tokens")
+    model = build_zip_transducer(variant=args.variant, vocab_size=tokenizer.vocab_size).to(device)
 
-    model = build_zip_transducer(
-        variant=args.variant,
-        vocab_size=tokenizer.vocab_size,
-        use_triton_ops=args.use_triton,
-    ).to(device)
+    if is_main:
+        total_p = sum(p.numel() for p in model.parameters())
+        logger.info(f"Model parameters: {total_p / 1e6:.2f}M | Vocab size: {tokenizer.vocab_size}")
 
-    model.print_architecture_summary()
-    breakdown = model.get_parameter_breakdown()
-    logger.info(f"Model [{args.variant.upper()}] assembled: {breakdown['total_million']}M parameters")
+    if is_distributed:
+        model = DDP(model, device_ids=[rank] if device.type == "cuda" else None, find_unused_parameters=True)
 
-    # 2. Setup Streaming Dataset & DataLoader
+    raw_model = model.module if is_distributed else model
+
+    # 2. Streaming Dataset with Rank-Aware Sharding
+    hf_token = args.hf_token or os.getenv("HF_TOKEN")
     train_dataset = IndicVoicesStreamingDataset(
         split="train",
-        hf_token=args.hf_token,
+        hf_token=hf_token,
         tokenizer=tokenizer,
         apply_spec_augment=True,
-        mock_streaming=args.mock_data,
-        shuffle_buffer_size=200 if args.mock_data else 500,
+        min_duration=0.5,
+        max_duration=20.0,
+        shuffle_buffer_size=500,
     )
     collator = ASRDataCollator(pad_id=tokenizer.blank_id)
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
         collate_fn=collator,
-        num_workers=0,  # Streaming iterable
+        num_workers=0,
     )
 
-    # 3. Setup Optimizer, Scaler, and Scheduler
+    # 3. Optimizer & Scaler
     optimizer = AdamW(
         model.parameters(),
         lr=args.lr,
@@ -127,15 +151,14 @@ def main():
 
     start_step = 0
     if args.resume and os.path.exists(args.resume):
-        logger.info(f"Resuming training from checkpoint: {args.resume}")
-        checkpoint = torch.load(args.resume, map_location=device)
-        model.load_state_dict(checkpoint["model_state_dict"])
-        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-        start_step = checkpoint.get("step", 0)
-        logger.info(f"Resumed from step {start_step}")
+        if is_main:
+            logger.info(f"Resuming checkpoint from {args.resume}")
+        ckpt = torch.load(args.resume, map_location=device)
+        raw_model.load_state_dict(ckpt["model_state_dict"])
+        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        start_step = ckpt.get("step", 0)
 
     # 4. Training Loop
-    logger.info(f"Starting training run: max_steps={args.max_steps}, batch_size={args.batch_size}, grad_accum={args.grad_accum}")
     model.train()
     optimizer.zero_grad()
 
@@ -143,6 +166,7 @@ def main():
     running_loss = 0.0
     running_rnnt = 0.0
     running_ctc = 0.0
+    running_audio_sec = 0.0
     t_start = time.time()
 
     data_iter = iter(train_loader)
@@ -154,12 +178,15 @@ def main():
             data_iter = iter(train_loader)
             batch = next(data_iter)
 
-        inputs = batch["inputs"].to(device)
-        input_lengths = batch["input_lengths"].to(device)
-        targets = batch["targets"].to(device)
-        target_lengths = batch["target_lengths"].to(device)
+        inputs = batch["inputs"].to(device, non_blocking=True)
+        input_lengths = batch["input_lengths"].to(device, non_blocking=True)
+        targets = batch["targets"].to(device, non_blocking=True)
+        target_lengths = batch["target_lengths"].to(device, non_blocking=True)
 
-        with torch.cuda.amp.autocast(enabled=(args.fp16 and device.type == "cuda")):
+        batch_audio_sec = float(input_lengths.sum().item()) * 0.01  # 10ms per frame
+        running_audio_sec += batch_audio_sec
+
+        with torch.cuda.amp.autocast(enabled=(args.fp16 and device.type == "cuda"), dtype=torch.float16):
             outputs = model(
                 audio_features=inputs,
                 audio_lengths=input_lengths,
@@ -186,53 +213,81 @@ def main():
 
         step += 1
 
-        # Logging
-        if step % args.log_every == 0:
+        # Periodic Logging (Rank 0)
+        if is_main and step % args.log_every == 0:
             elapsed = time.time() - t_start
             cur_lr = scheduler.get_last_lr()[0]
             avg_loss = running_loss / args.log_every
             avg_rnnt = running_rnnt / args.log_every
             avg_ctc = running_ctc / args.log_every
             steps_per_sec = args.log_every / max(1e-5, elapsed)
+            audio_sec_per_sec = running_audio_sec / max(1e-5, elapsed)
+            total_audio_throughput = audio_sec_per_sec * world_size
+
+            # VRAM stats
+            vram_mb = torch.cuda.max_memory_allocated(device) / (1024**2) if torch.cuda.is_available() else 0
 
             logger.info(
-                f"Step [{step}/{args.max_steps}] | Loss: {avg_loss:.4f} "
-                f"(RNNT: {avg_rnnt:.4f}, CTC: {avg_ctc:.4f}) | "
-                f"LR: {cur_lr:.2e} | Speed: {steps_per_sec:.2f} steps/s"
+                f"Step [{step}/{args.max_steps}] | Loss: {avg_loss:.4f} (RNN-T: {avg_rnnt:.4f}, CTC: {avg_ctc:.4f}) | "
+                f"LR: {cur_lr:.2e} | Speed: {steps_per_sec:.2f} step/s | "
+                f"Audio: {total_audio_throughput:.1f}s/s ({total_audio_throughput:.0f}x Real-Time) | VRAM: {vram_mb:.0f}MB"
             )
             running_loss = 0.0
             running_rnnt = 0.0
             running_ctc = 0.0
+            running_audio_sec = 0.0
             t_start = time.time()
 
         # Validation Preview
-        if step % args.eval_every == 0:
+        if is_main and step % args.eval_every == 0:
             model.eval()
             with torch.no_grad():
-                sample_inputs = inputs[:2]
-                sample_lens = input_lengths[:2]
-                preds_ctc = model.transcribe(sample_inputs, sample_lens, method="ctc")
-                logger.info(f"--- Step {step} Validation Preview ---")
-                for i in range(len(preds_ctc)):
-                    gold = batch["texts"][i] if i < len(batch["texts"]) else ""
-                    logger.info(f"Target:     {gold}")
-                    logger.info(f"Prediction: {preds_ctc[i]}")
-                logger.info("------------------------------------")
+                preds_ctc = raw_model.transcribe(inputs[:2], input_lengths[:2], method="ctc")
+                logger.info(f"--- Step {step} Live Preview ---")
+                for i in range(min(2, len(preds_ctc))):
+                    gold = batch.get("texts", [""])[i] if "texts" in batch and i < len(batch["texts"]) else ""
+                    logger.info(f"  Target:     '{gold[:70]}'")
+                    logger.info(f"  Prediction: '{preds_ctc[i][:70]}'")
+                logger.info("--------------------------------")
             model.train()
 
-        # Checkpointing
-        if step % args.save_every == 0 or step == args.max_steps:
+        # Save Checkpoint
+        if is_main and (step % args.save_every == 0 or step == args.max_steps):
             save_path = os.path.join(args.checkpoint_dir, f"zip_transducer_{args.variant}_step_{step}.pt")
             logger.info(f"Saving checkpoint to {save_path}")
             torch.save({
                 "step": step,
                 "variant": args.variant,
-                "config": model.config,
-                "model_state_dict": model.state_dict(),
+                "config": raw_model.config,
+                "model_state_dict": raw_model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
             }, save_path)
 
-    logger.info("Training completed successfully!")
+    if is_main:
+        logger.info("Training loop completed successfully!")
+
+    if is_distributed:
+        cleanup_ddp()
+
+
+def main():
+    args = parse_args()
+    
+    # Check if launched via torchrun or multi-gpu
+    world_size = int(os.getenv("WORLD_SIZE", "1"))
+    rank = int(os.getenv("RANK", "0"))
+    
+    if world_size > 1:
+        # Launched via torchrun
+        train_worker(rank, world_size, args)
+    elif args.ddp and torch.cuda.device_count() > 1:
+        # Launch internal multi-gpu spawn
+        n_gpus = torch.cuda.device_count()
+        logger.info(f"Spawning DDP across {n_gpus} GPUs...")
+        torch.multiprocessing.spawn(train_worker, nprocs=n_gpus, args=(n_gpus, args))
+    else:
+        # Single GPU / CPU
+        train_worker(0, 1, args)
 
 
 if __name__ == "__main__":

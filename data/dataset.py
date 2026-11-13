@@ -135,13 +135,18 @@ class IndicVoicesStreamingDataset(IterableDataset):
             yield from self._iter_mock_stream(worker_id, num_workers)
             return
 
+        # Multi-GPU and Multi-Worker stream partitioning
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+        total_workers = world_size * num_workers
+        global_worker_id = rank * num_workers + worker_id
+
         # Stream with reservoir shuffle buffer
         buffer = []
         sample_idx = 0
 
         for raw_sample in hf_ds:
-            # Multi-worker stream partitioning
-            if sample_idx % num_workers != worker_id:
+            if sample_idx % total_workers != global_worker_id:
                 sample_idx += 1
                 continue
             sample_idx += 1
