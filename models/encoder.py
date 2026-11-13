@@ -140,7 +140,7 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if HAS_TRITON_OPS and x.is_cuda and fused_rmsnorm is not None:
+        if HAS_TRITON_OPS and x.is_cuda and fused_rmsnorm is not None and x.is_contiguous():
             return fused_rmsnorm(x, self.weight, self.eps)
         variance = x.pow(2).mean(dim=-1, keepdim=True)
         return x * torch.rsqrt(variance + self.eps) * self.weight
@@ -537,11 +537,11 @@ class SubsamplingStem1D(nn.Module):
         
         # Stage 1
         x = self.stage1_pw(self.stage1_dw(x))
-        x = self.stage1_act(self.stage1_norm(x.transpose(1, 2)).transpose(1, 2))
+        x = self.stage1_act(self.stage1_norm(x.transpose(1, 2).contiguous()).transpose(1, 2))
         
         # Stage 2
         x = self.stage2_pw(self.stage2_dw(x))
-        x = self.stage2_act(self.stage2_norm(x.transpose(1, 2)).transpose(1, 2))
+        x = self.stage2_act(self.stage2_norm(x.transpose(1, 2).contiguous()).transpose(1, 2))
         
         # Output: (B, T0, D)
         out = x.transpose(1, 2)

@@ -164,7 +164,7 @@ def fused_rmsnorm(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> t
     weight: [D]
     Returns: [B, T, D]
     """
-    if HAS_TRITON and x.is_cuda and weight.is_cuda and x.ndim == 3 and x.shape[-1] <= 1024:
+    if HAS_TRITON and x.is_cuda and weight.is_cuda and x.ndim == 3 and x.shape[-1] <= 1024 and x.is_contiguous():
         if x.requires_grad or weight.requires_grad:
             return _FusedRMSNormFunction.apply(x, weight, eps)
         B, T, D = x.shape
