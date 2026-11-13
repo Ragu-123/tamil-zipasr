@@ -1,0 +1,77 @@
+{
+  "status": "VERIFIED_ON_KAGGLE_GPU",
+  "github_repository": "https://github.com/Ragu-123/tamil-zipasr.git",
+  "hardware": {
+    "device_count": 2,
+    "device_name": "Tesla T4",
+    "pytorch": "2.11.0+cu130",
+    "cuda": "13.0",
+    "triton": "3.6.0"
+  },
+  "tokenizer": {
+    "type": "TamilAksharaTokenizer",
+    "vocab_size": 431,
+    "granularity": "Linguistic Akshara (Syllabic Compound Glyphs)",
+    "subscript_superscript_normalized": true,
+    "lossless_roundtrip": true
+  },
+  "model_family": {
+    "small": {
+      "total_million": 10.465,
+      "encoder_million": 9.332,
+      "decoder_million": 1.133,
+      "dim": 256,
+      "stages": [3, 6, 3],
+      "downsample_rates": [1, 2, 4],
+      "gqa_heads": [8, 2],
+      "predictor_order": 2,
+      "ctc_rtf_gpu": 0.002351,
+      "rnnt_rtf_gpu": 0.062223
+    },
+    "medium": {
+      "total_million": 51.226,
+      "encoder_million": 49.25,
+      "decoder_million": 1.98,
+      "dim": 512,
+      "stages": [4, 8, 4],
+      "downsample_rates": [1, 2, 4],
+      "gqa_heads": [8, 2],
+      "predictor_order": 2
+    },
+    "large": {
+      "total_million": 115.298,
+      "encoder_million": 112.28,
+      "decoder_million": 3.02,
+      "dim": 768,
+      "stages": [4, 12, 4],
+      "downsample_rates": [1, 2, 4],
+      "gqa_heads": [12, 4],
+      "predictor_order": 2
+    }
+  },
+  "performance_benchmarks_gpu": {
+    "batch_size": 4,
+    "audio_duration_seconds": 10.0,
+    "forward_time_ms": 72.01,
+    "backward_time_ms": 55.31,
+    "peak_vram_mb": 1123.71,
+    "ctc_greedy_latency_ms": 23.51,
+    "ctc_greedy_rtf": 0.002351,
+    "rnnt_greedy_latency_ms": 622.23,
+    "rnnt_greedy_rtf": 0.062223,
+    "rtf_realtime_speedup_ctc": "425.4x faster than real-time",
+    "rtf_realtime_speedup_rnnt": "16.1x faster than real-time"
+  },
+  "triton_parity": {
+    "rmsnorm_diff": 7.152557373046875e-07,
+    "swiglu_diff": 0.001953125,
+    "ctc_decoder_match": true
+  },
+  "zero_disk_streaming_training": {
+    "verified": true,
+    "multi_task_loss": "0.85 * RNN-T + 0.15 * CTC",
+    "spec_augment": true,
+    "mixed_precision_fp16": true,
+    "checkpoint_save_and_resume": true
+  }
+}
