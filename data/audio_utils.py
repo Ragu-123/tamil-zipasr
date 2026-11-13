@@ -61,6 +61,13 @@ def decode_audio_from_buffer(
         waveform: Mono audio tensor of shape (1, num_samples) as float32 in [-1.0, 1.0].
         sample_rate: Sample rate (equal to target_sr).
     """
+    # 0. Handle Hugging Face AudioDecoder / objects with get_all_samples()
+    if hasattr(audio_data, "get_all_samples"):
+        samples_obj = audio_data.get_all_samples()
+        waveform = samples_obj.data if hasattr(samples_obj, "data") else samples_obj
+        sr = getattr(samples_obj, "sample_rate", target_sr)
+        return _process_waveform(waveform, sr, target_sr)
+
     # 1. Handle Hugging Face Audio dict
     if isinstance(audio_data, dict):
         if "array" in audio_data and audio_data["array"] is not None:
