@@ -23,6 +23,10 @@ from __future__ import annotations
 
 import os
 import sys
+
+# Optimize PyTorch CUDA memory allocator to eliminate fragmentation on 16GB GPUs
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
 import time
 import math
 import argparse
@@ -163,8 +167,8 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Train ZipTransducer-Tamil on Dual Tesla T4 GPUs")
     parser.add_argument("--variant", type=str, default="medium", choices=["small", "medium", "large"],
                         help="Model variant: small (~10.5M), medium (~51.2M), large (~115.3M)")
-    parser.add_argument("--batch-size", type=int, default=32, help="Batch size per GPU (default: 32 per T4 -> 64 total across 2x T4)")
-    parser.add_argument("--grad-accum", type=int, default=4, help="Gradient accumulation steps (effective batch: 256 utterances)")
+    parser.add_argument("--batch-size", type=int, default=16, help="Batch size per GPU (default: 16 per T4 -> 32 total across 2x T4)")
+    parser.add_argument("--grad-accum", type=int, default=8, help="Gradient accumulation steps (effective batch: 256 utterances)")
     parser.add_argument("--lr", type=float, default=5e-4, help="Peak learning rate for AdamW")
     parser.add_argument("--min-lr", type=float, default=1e-5, help="Minimum learning rate")
     parser.add_argument("--weight-decay", type=float, default=1e-2, help="Weight decay for AdamW")
@@ -177,7 +181,7 @@ def parse_args():
     parser.add_argument("--prefetch-factor", type=int, default=4, help="Prefetch factor per DataLoader worker")
     parser.add_argument("--shuffle-buffer", type=int, default=1500, help="In-memory streaming shuffle buffer size")
     parser.add_argument("--mock-data", action="store_true", default=False, help="Use synthetic data stream for offline testing")
-    parser.add_argument("--hf-token", type=str, default=None, help="Hugging Face access token")
+    parser.add_argument("--hf-token", type=str, default=None, nargs="?", const="", help="Hugging Face access token")
     parser.add_argument("--checkpoint-dir", type=str, default="./checkpoints", help="Directory to save checkpoints")
     parser.add_argument("--save-every", type=int, default=1000, help="Checkpoint frequency (steps)")
     parser.add_argument("--log-every", type=int, default=25, help="Logging frequency (steps)")
@@ -253,14 +257,34 @@ def train_worker(rank: int, world_size: int, args: argparse.Namespace):
     raw_model = model.module if is_distributed else model
 
     # 2. Streaming Dataset with Rank-Aware Sharding & Multi-Worker Prefetching
-    hf_token = args.hf_token or os.getenv("HF_TOKEN")
+    hf_token = args.hf_token if (args.hf_token and args.hf_token.strip()) else None
+    if not hf_token:
+        hf_token = os.getenv("HF_TOKEN") or os.getenv("HF_TOKEN1") or os.getenv("hf_token")
+    if not hf_token:
+        try:
+            from kaggle_secrets import UserSecretsClient
+            usc = UserSecretsClient()
+            for key in ["HF_TOKEN", "HF_TOKEN1", "hf_token"]:
+                try:
+                    sec = usc.get_secret(key)
+                    if sec and sec.strip():
+                        hf_token = sec.strip()
+                        break
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    if is_main and hf_token:
+        logger.info("Authenticated Hugging Face token successfully loaded.")
+
     train_dataset = IndicVoicesStreamingDataset(
         split="train",
         hf_token=hf_token,
         tokenizer=tokenizer,
         apply_spec_augment=True,
         min_duration=0.5,
-        max_duration=20.0,
+        max_duration=15.0,  # Cap at 15.0s to prevent outlier 25s+ utterances from blowing up the 4D joint tensor
         shuffle_buffer_size=args.shuffle_buffer,
         mock_streaming=args.mock_data,
     )
